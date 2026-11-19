@@ -1,0 +1,57 @@
+# ai-safe configuration. Validated before every command.
+version: 1
+
+scanner:
+  engine: gitleaks          # gitleaks | builtin  (builtin rules always run in addition)
+  # gitleaks_path: /usr/local/bin/gitleaks
+  scan_git_history: true
+  history_log_opts: "--all" # all reachable branches and tags
+  scan_untracked: true
+  scan_ignored: true
+  scan_staged: true
+  scan_unstaged: true
+  scan_commit_messages: true
+  max_file_size_kb: 2048
+  custom_rules: []
+  # custom_rules:
+  #   - id: internal-service-token
+  #     description: Internal service token
+  #     regex: "isvc_(?P<secret>[A-Za-z0-9]{32})"
+  #     category: ACCESS_TOKEN
+
+sanitization:
+  exclude:
+    - .env
+    - .env.*
+    - "*.pem"
+    - "*.key"
+    - credentials.json
+    - secrets/
+    - .ssh/
+  include_ignored_files: false
+  history_summary: false
+  placeholders:
+    enabled: true
+    deterministic: true
+
+workspace:
+  isolated: true
+  include_git_history: false
+  verify_before_ai_access: true
+  # base_dir: /path/outside/the/repo   # default: system temp dir
+  # state_dir: ~/.local/state/ai-safe
+
+integration:
+  require_approval: true
+  auto_commit: false
+  auto_push: false
+  allow_deletions: true
+
+security:
+  fail_closed: true
+  redact_logs: true
+  reject_symlinks: true
+  store_secret_values: false   # true = keep an encrypted copy of original values (needs passphrase)
+  encrypt_mapping: true
+  allow_ai_launch: false
+  launch_command: ["claude"]

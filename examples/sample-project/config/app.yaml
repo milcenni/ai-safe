@@ -1,0 +1,7 @@
+service:
+  name: sample
+  port: 8080
+database:
+  host: db.internal
+  user: app
+  password: __FAKE_YAML_PASSWORD__

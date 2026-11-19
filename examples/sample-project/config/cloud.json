@@ -1,0 +1,5 @@
+{
+  "region": "eu-west-1",
+  "aws_access_key_id": "__FAKE_AWS_KEY_ID__",
+  "aws_secret_access_key": "__FAKE_AWS_SECRET__"
+}
