@@ -203,6 +203,9 @@ def integrate(
     # Only a full integration of an unchanged workspace means "workspace == what the developer
     # accepted" (resync relies on it). Any edit during review/approval clears it.
     unchanged = tree_hash(session.workspace_path) == reviewed_hash
-    session.integrated_tree_hash = reviewed_hash if unchanged and not exclude_paths else None
+    # A change review left out (``manual`` binary/mode-only, Git metadata, already-absent deletion, ...)
+    # is not integrated, so resync without --discard would silently drop it.
+    full = not exclude_paths and not review.left_out()
+    session.integrated_tree_hash = reviewed_hash if unchanged and full else None
     session.save()
     return result

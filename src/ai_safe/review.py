@@ -84,6 +84,13 @@ class ReviewReport:
     def passed(self) -> bool:
         return not is_blocking(self.issues)
 
+    def left_out(self) -> list[str]:
+        """Changed paths that the plan does not integrate, other than tool metadata
+        that review always skips (``is_tool_metadata``). Empty means the plan
+        integrates every AI change (e.g. no ``manual`` binary/mode-only change)."""
+        planned = {p.path for p in self.plan}
+        return [c.path for c in self.changes if c.path not in planned and not is_tool_metadata(c.path)]
+
     def add(self, severity: Severity, code: str, path: str, message: str, line: int | None = None) -> None:
         self.issues.append(Issue(severity, code, path, message, line))
 
@@ -101,7 +108,7 @@ class ReviewReport:
 _METADATA_POLICIES = (ClaudePath.AI_SAFE_SKILL, ClaudePath.SETTINGS, ClaudePath.OTHER)
 
 
-def _is_tool_metadata(path: str) -> bool:
+def is_tool_metadata(path: str) -> bool:
     """ai-safe / Claude Code files that are never integrated. The team's
     ``.claude/skills|commands|agents/**`` (TEAM) are not metadata."""
     return path in generated_paths() or claude_path_policy(path) in _METADATA_POLICIES
@@ -181,7 +188,7 @@ def review_session(session: Session, cfg: AISafeConfig, scanner: Scanner, *, exc
             if not any(i.code == "nested-git" for i in report.issues):
                 report.add(Severity.WARNING, "nested-git", path.split("/.git")[0] or ".git", "AI created Git metadata in the workspace; it will not be integrated")
             continue
-        if _is_tool_metadata(path):
+        if is_tool_metadata(path):
             report.skipped.append(f"{path} (ai-safe / Claude Code metadata - not integrated)")
             continue
         if is_security_tool_file(path):
@@ -351,7 +358,8 @@ def _review_deletion(report: ReviewReport, ch: FileChange, manifest_files: dict,
         return
     digest = keyed_digest(target.read_bytes(), salt)
     if entry is None or entry.get("original_digest") != digest:
-        report.add(Severity.ERROR, "original-changed", ch.path, "original file changed since the workspace was created - not deleting")
+        report.add(Severity.ERROR, "original-changed", ch.path, "original file changed since the workspace was created - not deleting; "
+                   "run ai-safe resync before the AI continues")
         return
     if entry.get("action") == "sanitized":
         report.add(Severity.WARNING, "credential-file-deleted", ch.path, "AI deleted a file that contains original credentials - review carefully")
@@ -378,7 +386,8 @@ def _plan_modified(report: ReviewReport, path: str, data: bytes, new_text: str |
     orig_bytes = target.read_bytes()
     digest = keyed_digest(orig_bytes, salt)
     if entry is None or entry.get("original_digest") != digest:
-        report.add(Severity.ERROR, "original-changed", path, "original file changed since the workspace was created - re-run ai-safe start")
+        report.add(Severity.ERROR, "original-changed", path, "original file changed since the workspace was created (for example by an earlier "
+                   "integration) - integrate the other changes, then run ai-safe resync before the AI continues")
         return
     mode = stat.S_IMODE(target.stat().st_mode)
     if ch.kind == "mode_changed" or new_text is None:

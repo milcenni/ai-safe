@@ -47,7 +47,8 @@ Before doing anything else:
 - Never try to recover sanitized values (no decoding, no searching history, no asking).
 - Never print environment variables wholesale (`env`, `printenv`, `set`).
 - Never run `git push`, `ai-safe integrate` or `ai-safe cleanup`. Integration is a
-  developer-only step.
+  developer-only step. After the developer integrates, ask them to run `ai-safe resync` on the
+  host before you continue; never run it yourself.
 
 ## 3. How to handle credentials in code
 

@@ -468,3 +468,43 @@ def test_cli_verify_does_not_clear_resyncing(project, monkeypatch):
     after = Session.load(project.session.state_path)
     assert after.status == "resyncing" and after.verified_tree_hash is None, r.output
     assert r.exit_code == 1 and "ai-safe resync" in r.output
+
+
+def test_mode_only_change_left_out_blocks_integrated_hash(project):
+    os.chmod(project.ws / "README.md", 0o755)  # mode-only: WARNING manual, not integrated
+    edit_ws(project)
+    res = integrate(project.session, project.cfg, project.scanner, confirm=APPROVE, cwd=project.repo)
+    assert not res.aborted, res.reason
+    assert res.applied == ["app/util.py"]
+    assert any(i.code == "manual" for i in res.review.issues)
+    assert Session.load(project.session.state_path).integrated_tree_hash is None
+    assert [c.path for c in pending_changes(project.session)] != []
+    out = run(project)
+    assert not out.ok and "resync --discard" in out.reason
+    assert os.stat(project.ws / "README.md").st_mode & 0o111
+
+
+def test_tool_metadata_skip_still_records_integrated_hash(project):
+    write(project.ws, {".claude/settings.local.json": "{}\n"})
+    edit_ws(project)
+    res = integrate(project.session, project.cfg, project.scanner, confirm=APPROVE, cwd=project.repo)
+    assert not res.aborted, res.reason
+    assert Session.load(project.session.state_path).integrated_tree_hash is not None
+
+
+def test_resync_ignores_claude_local_settings(project):
+    write(project.ws, {".claude/settings.local.json": '{"permissions": {"allow": ["Bash(ls)"]}}\n'})
+    assert pending_changes(project.session) == []
+    res = integrate(project.session, project.cfg, project.scanner, confirm=APPROVE, cwd=project.repo)
+    assert res.aborted and res.reason == "no integratable changes"
+    out = run(project)
+    assert out.ok, out.reason
+
+
+def test_original_changed_points_at_resync(project):
+    edit_ws(project)
+    (project.repo / "app/util.py").write_text("def add(a, b):\n    return a + b + 0\n")
+    res = integrate(project.session, project.cfg, project.scanner, confirm=APPROVE, cwd=project.repo)
+    assert res.aborted
+    msgs = [i.message for i in res.review.issues if i.code == "original-changed"]
+    assert msgs and all("ai-safe resync" in m for m in msgs)

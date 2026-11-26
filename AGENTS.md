@@ -130,4 +130,6 @@ It rebuilds the workspace in a staging directory, verifies it there, and only th
 contents in place, so the path stays the same. Ask the user to close the AI session in the workspace
 first. Resync refuses while the workspace holds changes that were not integrated: the user either runs
 `ai-safe integrate` first, or `ai-safe resync --discard` and types `discard`. Never suggest `--discard`
-without saying that it throws the AI's work away.
+without saying that it throws the AI's work away. After every `ai-safe integrate`, the user runs
+`ai-safe resync` before you continue working in the workspace; otherwise the next review compares
+against an outdated snapshot and reports `original-changed`.

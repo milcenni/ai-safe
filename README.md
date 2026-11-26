@@ -55,6 +55,8 @@ The agent follows [AGENTS.md](AGENTS.md) and asks before every download. Then ru
 Those two commands are yours, not the agent's: `start` reads your real repository, and `open` starts the AI
 session on the verified workspace. Inside the workspace the AI works freely. When you want the latest
 state of your repository again, run `ai-safe resync` (after `ai-safe integrate`, or with `--discard`).
+After every `ai-safe integrate`, run `ai-safe resync` before the AI continues working, so the next review
+compares against your updated repository.
 
 ---
 
@@ -272,8 +274,12 @@ interrupt during the swap rolls both back; while the swap runs the session is ma
 verified hash, so if the process dies or a rollback cannot complete, `open`, `integrate` and `verify`
 refuse the session until you run `ai-safe resync` again. If a rollback cannot complete, the old contents
 are kept (never deleted) and the error names the directory. It runs without `--discard` only when the workspace has no changes since the
-snapshot, or is exactly what you last integrated in full. Otherwise integrate first, or pass `--discard`
-and type `discard` to throw the changes away. It refuses inside an AI agent session.
+snapshot, or is exactly what you last integrated in full. A full integration means every AI change
+was applied: a change that review left out (a binary or mode-only change, Git metadata, `--exclude`)
+still counts as pending. Changes to tool metadata that is never integrated (ai-safe's generated files and
+skills, `.claude/settings*.json`, other `.claude/` paths) do not count. Otherwise integrate first, or pass
+`--discard` and type `discard` to throw the changes away. After `ai-safe integrate`, run `ai-safe resync`
+before the AI continues working. It refuses inside an AI agent session.
 
 `verify`, `review` and `mapping` find their session automatically, either from the workspace marker (when
 run inside a workspace) or from the latest session for the current repository.
@@ -529,7 +535,8 @@ deletion.
 - **Verification failed during `start`:** the workspace was already deleted. Fix the reported cause, then
   run `ai-safe start` again. Typical fixes are adding an exclusion, removing a key file, or adding a
   `custom_rule`.
-- **Integration refused because the original changed:** run `ai-safe start` again, or apply the redacted
+- **Integration refused because the original changed** (`original-changed`, for example after an earlier
+  integration): integrate the other changes, run `ai-safe resync`, and let the AI redo the rest, or apply the redacted
   patch record by hand. It is at `~/.local/state/ai-safe/sessions/<id>/patches/`, with credential lines
   masked.
 - **Mistakes after integration:** nothing is committed. Use `git diff` and `git checkout -- <file>` to
@@ -569,7 +576,8 @@ ai-safe integrate                # type 'apply'
 git diff                         # credentials untouched except where the AI removed a hardcoded one
 git commit -am "..."             # your decision; ai-safe never commits or pushes
 
-# 6. Later: refresh the workspace from your repository (same path; close the AI session first)
+# 6. After integrating, or later: refresh the workspace from your repository
+#    (same path; close the AI session first, and resync before the AI continues)
 ai-safe resync
 
 # 7. Clean up

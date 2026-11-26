@@ -17,6 +17,7 @@ from pathlib import Path
 from ai_safe.config import AISafeConfig
 from ai_safe.credential_map import CredentialMap
 from ai_safe.patch_manager import FileChange, collect_changes
+from ai_safe.review import is_tool_metadata
 from ai_safe.sanitizer import Sanitizer
 from ai_safe.scanner import Scanner
 from ai_safe.security import (
@@ -52,11 +53,13 @@ class ResyncResult:
 
 def pending_changes(session: Session) -> list[FileChange]:
     """Workspace changes since the snapshot, or ``[]`` when the workspace is exactly
-    what the developer last integrated in full."""
+    what the developer last integrated in full. Changes that review always skips as
+    tool metadata (generated files, ai-safe skills, ``.claude/settings*.json``, other
+    ``.claude/`` paths) are never integrated, so they do not count."""
     ws = session.workspace_path
     if session.integrated_tree_hash and tree_hash(ws) == session.integrated_tree_hash:
         return []
-    return collect_changes(session.snapshot_dir, ws)
+    return [c for c in collect_changes(session.snapshot_dir, ws) if not is_tool_metadata(c.path)]
 
 
 def _check_workspace(session: Session, store: SessionStore) -> Path:
