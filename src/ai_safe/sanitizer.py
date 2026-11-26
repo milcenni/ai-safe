@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from ai_safe import git_history as gh
-from ai_safe.classifier import match_exclude
+from ai_safe.classifier import ClaudePath, claude_path_policy, sensitive_match
 from ai_safe.config import AISafeConfig
 from ai_safe.credential_map import CredentialMap
 from ai_safe.models import WORKING_TREE_LOCATIONS, Finding, Location
@@ -57,7 +57,7 @@ from ai_safe.workspace import (
 @dataclass
 class ManifestEntry:
     path: str
-    action: str  # sanitized | copied | excluded | generated
+    action: str  # sanitized | copied | excluded | generated | merged
     reason: str | None = None
     replacements: int = 0
     placeholders: list[str] = field(default_factory=list)
@@ -98,6 +98,7 @@ class Sanitizer:
         self.scanner = scanner
         self.salt = salt
         self.excludes = cfg.sanitization.all_excludes()
+        self._team_settings: dict | None = None
 
     def candidates(self, scan: ScanResult) -> list[str]:
         dummy = ScanResult(root=scan.root, is_git=scan.is_git)
@@ -112,6 +113,7 @@ class Sanitizer:
     def run(self, scan: ScanResult, session: Session, *, passphrase: str | None = None) -> SanitizeResult:
         root = scan.root
         ws = session.workspace_path
+        self._team_settings = None  # never carry one repository's settings into another run
         registry = PlaceholderRegistry(self.salt, self.cfg.sanitization.placeholders.deterministic)
 
         # Pre-register in a deterministic order: working-tree findings first.
@@ -145,7 +147,7 @@ class Sanitizer:
         cmap = CredentialMap.from_registry(registry)
         placeholders_doc = _placeholders_doc(cmap)
         write_private_file(ws / PLACEHOLDERS_FILE, placeholders_doc, mode=0o644)
-        install_claude_integration(ws, Path(session.state_dir).parent.parent, self.cfg)
+        install_claude_integration(ws, Path(session.state_dir).parent.parent, self.cfg, self._team_settings)
 
         cmap.save(session.state_path, registry, store_secret_values=self.cfg.security.store_secret_values, passphrase=passphrase)
         manifest = {
@@ -181,9 +183,15 @@ class Sanitizer:
             return excluded(f"unsafe path name: {exc}")
         if is_git_metadata_path(relp):
             return excluded("git metadata")
-        if str(relp) in generated_paths():
+        is_settings = claude_path_policy(rel) is ClaudePath.SETTINGS
+        if is_settings:
+            if not self.cfg.workspace.generate_claude_settings:
+                return excluded("team .claude/settings.json not merged (workspace.generate_claude_settings is false)")
+            if self._team_settings is not None:
+                return excluded("duplicate .claude/settings.json (not merged)")
+        elif str(relp) in generated_paths():
             return excluded("reserved ai-safe path")
-        pat = match_exclude(rel, self.excludes)
+        pat = sensitive_match(rel, self.excludes)
         if pat:
             return excluded(f"sensitive path (matches {pat!r})")
         src = root / rel
@@ -207,6 +215,8 @@ class Sanitizer:
         mode = safe_file_mode(st.st_mode, self.cfg.sanitization.preserve_permissions)
 
         if is_binary(data):
+            if is_settings:
+                return excluded("binary .claude/settings.json (not merged)", digest)
             ext = Path(rel).suffix.lower()
             if ext not in self.cfg.sanitization.allowed_binary_extensions:
                 return excluded("binary file (not in sanitization.allowed_binary_extensions)", digest)
@@ -227,6 +237,17 @@ class Sanitizer:
             outcome = redact_text(text, rel, findings, registry, self.scanner.detector, global_secrets)
         except RedactionError as exc:
             return excluded(f"unresolved secret - fail closed ({exc})", digest)
+        if is_settings:
+            # Never written here: install_claude_integration writes the merged file.
+            try:
+                parsed = json.loads(outcome.text)
+            except ValueError:
+                return excluded("invalid JSON in .claude/settings.json (not merged)", digest)
+            if not isinstance(parsed, dict):
+                return excluded("invalid JSON in .claude/settings.json: not an object (not merged)", digest)
+            self._team_settings = parsed
+            return ManifestEntry(rel, "merged", "merged into generated .claude/settings.json",
+                                 outcome.replacements, outcome.placeholders, original_digest=digest)
         out = outcome.text.encode("utf-8")
         self._write(dst, out, mode)
         action = "sanitized" if outcome.replacements else "copied"

@@ -21,7 +21,7 @@ import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ai_safe.classifier import match_exclude
+from ai_safe.classifier import ClaudePath, claude_path_policy, sensitive_match
 from ai_safe.config import AISafeConfig
 from ai_safe.detectors import PRIVATE_KEY_HEADER, PUTTY_KEY
 from ai_safe.models import Issue, Location, Severity, is_blocking
@@ -158,13 +158,13 @@ def verify_workspace(
             report.add(Severity.WARNING, "world-writable", rel, "world-writable file")
         if rel in generated:
             pass
-        elif rel.startswith(".claude/"):
+        elif rel.startswith(".claude/") and claude_path_policy(rel) is not ClaudePath.TEAM:
             if rel == ".claude/settings.local.json":
                 report.add(Severity.WARNING, "claude-local-settings", rel, "Claude Code local settings created in workspace (not integrated)")
             else:
                 report.add(Severity.ERROR, "unexpected-claude-file", rel, "unexpected file under .claude/ (may contain hooks or credentials)")
         else:
-            pat = match_exclude(rel, excludes)
+            pat = sensitive_match(rel, excludes)
             if pat:
                 report.add(Severity.ERROR, "credential-file", rel, f"sensitive/credential file present (matches {pat!r})")
         if e.data is None:
