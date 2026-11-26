@@ -154,6 +154,10 @@ class Session:
         return json.loads(self.manifest_path.read_text())
 
 
+def _is_session_id(name: str) -> bool:
+    return bool(name) and all(c in "0123456789abcdef" for c in name)
+
+
 class SessionStore:
     def __init__(self, root: Path) -> None:
         self.root = ensure_private_dir(Path(root))
@@ -201,7 +205,7 @@ class SessionStore:
         return session
 
     def get(self, sid: str) -> Session:
-        if not sid or not all(c in "0123456789abcdef" for c in sid):
+        if not _is_session_id(sid):
             raise SecurityError("invalid session id")
         d = self.sessions_dir / sid
         if not (d / "session.json").exists():
@@ -211,6 +215,9 @@ class SessionStore:
     def list(self) -> list[Session]:
         out = []
         for d in sorted(self.sessions_dir.iterdir()):
+            # Only real session ids; e.g. a resync staging dir ``<id>.resync`` is never a session.
+            if not _is_session_id(d.name) or d.is_symlink():
+                continue
             if (d / "session.json").exists():
                 try:
                     out.append(Session.load(d))
@@ -423,3 +430,59 @@ def tree_hash(root: Path) -> str:
             elif stat.S_ISLNK(st.st_mode):
                 h.update(os.readlink(full).encode("utf-8", "surrogateescape"))
     return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# In-place replacement (resync)
+# ---------------------------------------------------------------------------
+
+REPLACE_BACKUP_PREFIX = "ai-safe-old-"
+
+
+def replace_tree_contents(dst: Path, src: Path) -> None:
+    """Replace every entry inside ``dst`` with the entries of ``src``.
+
+    ``dst`` itself is never removed or recreated, so its path and inode stay the
+    same (an open AI session keeps its working directory). Entries are moved with
+    ``os.rename`` only, never copied, and symlinks are never followed. The old
+    entries are first moved into a private sibling backup directory; if any move
+    fails (for example ``EXDEV``), everything is moved back and ``SecurityError``
+    is raised, so ``dst`` is left as it was. On success the backup is removed.
+    """
+    dst, src = Path(dst), Path(src)
+    for d in (dst, src):
+        if d.is_symlink() or not d.is_dir():
+            raise SecurityError("in-place replacement needs two real directories")
+    if os.lstat(dst).st_dev != os.lstat(src).st_dev:
+        raise SecurityError("staging directory is on a different filesystem; workspace left untouched")
+    backup = secure_mkdtemp(REPLACE_BACKUP_PREFIX, dst.parent)
+    moved_out: list[str] = []
+    moved_in: list[str] = []
+    keep_backup = False
+    try:
+        try:
+            for name in sorted(os.listdir(dst)):
+                os.rename(dst / name, backup / name)
+                moved_out.append(name)
+            for name in sorted(os.listdir(src)):
+                os.rename(src / name, dst / name)
+                moved_in.append(name)
+        except OSError:
+            rolled_back = True
+            for name in reversed(moved_in):
+                try:
+                    os.rename(dst / name, src / name)
+                except OSError:
+                    rolled_back = False
+            for name in reversed(moved_out):
+                try:
+                    os.rename(backup / name, dst / name)
+                except OSError:
+                    rolled_back = False
+            if not rolled_back:
+                keep_backup = True
+                raise SecurityError(f"workspace replacement failed and could not be fully rolled back; old contents kept in {backup}") from None
+            raise SecurityError("workspace replacement failed (cross-filesystem or I/O error); workspace left untouched") from None
+    finally:
+        if not keep_backup:
+            secure_remove_tree(backup)

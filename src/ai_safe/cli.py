@@ -320,6 +320,42 @@ def integrate(
     c.print("Nothing was committed or pushed. Inspect with `git diff`, run your tests, then commit yourself.")
 
 
+@app.command()
+@guarded
+def resync(
+    session_id: SessionOpt = None,
+    config: ConfigOpt = None,
+    discard: Annotated[bool, typer.Option("--discard", help="Throw away workspace changes that were not integrated")] = False,
+) -> None:
+    """Rebuild the workspace from the original repository in place (same path), verified before the swap."""
+    from ai_safe.resync import pending_changes
+    from ai_safe.resync import resync as do_resync
+
+    session, cfg, store, scanner = _session_context(session_id, config)
+    c = console()
+    c.print("[bold yellow]Close any AI session in the workspace before resyncing.[/bold yellow]")
+    if detect_ai_agent_env():
+        raise SecurityError("resync must be run by the developer, not by an AI agent. Run `ai-safe resync` yourself in a normal terminal.")
+    pending = pending_changes(session)
+    if discard and pending:
+        answer = typer.prompt(f"Type 'discard' to throw away {len(pending)} uncommitted workspace change(s)",
+                              default="", show_default=False)
+        if answer.strip() != "discard":
+            c.print("[yellow]Resync aborted:[/yellow] workspace left unchanged.")
+            raise typer.Exit(EXIT_FAIL)
+    salt = store.repo_salt(session.repo_path)
+    res = do_resync(session, cfg, store, scanner, salt, discard=discard, passphrase=_passphrase(cfg))
+    if res.verification is not None:
+        write_json(session.reports_dir / "verify.json", res.verification.public())
+        if not res.ok:
+            render_issues("Verification", res.verification.issues, c, False)
+    if not res.ok:
+        c.print(f"[yellow]Resync not applied:[/yellow] {res.reason}. The workspace was left unchanged.")
+        raise typer.Exit(EXIT_FAIL)
+    c.print("[bold green]Workspace resynced (same path)[/bold green]")
+    c.print(f"  Workspace : {session.workspace}")
+
+
 # ---------------------------------------------------------------------------
 # housekeeping
 # ---------------------------------------------------------------------------
