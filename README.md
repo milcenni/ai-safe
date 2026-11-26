@@ -24,19 +24,37 @@ Developer repo → discovery → classification → sanitization → AI workspac
 
 ## Contents
 
-1. [What ai-safe does](#what-ai-safe-does)
-2. [Threat model](#threat-model)
-3. [Architecture](#architecture)
-4. [Installation](#installation)
-5. [CLI usage](#cli-usage)
-6. [Claude Code integration](#claude-code-integration)
-7. [Configuration](#configuration)
-8. [Sanitization process](#sanitization-process)
-9. [Git history handling](#git-history-handling)
-10. [Security limitations](#security-limitations)
-11. [Recovery and cleanup](#recovery-and-cleanup)
-12. [Example workflow](#example-workflow)
-13. [Development and tests](#development-and-tests)
+1. [Quick Start: ask your AI to install](#quick-start-ask-your-ai-to-install)
+2. [What ai-safe does](#what-ai-safe-does)
+3. [Threat model](#threat-model)
+4. [Architecture](#architecture)
+5. [Installation](#installation)
+6. [CLI usage](#cli-usage)
+7. [Claude Code integration](#claude-code-integration)
+8. [Configuration](#configuration)
+9. [Sanitization process](#sanitization-process)
+10. [Git history handling](#git-history-handling)
+11. [Security limitations](#security-limitations)
+12. [Recovery and cleanup](#recovery-and-cleanup)
+13. [Example workflow](#example-workflow)
+14. [Development and tests](#development-and-tests)
+
+---
+
+## Quick Start: ask your AI to install
+
+Clone this repository, open an AI coding agent in it, and give it this prompt:
+
+> Install ai-safe for me (ask me global or local). If this project is not a Git repository, initialise Git
+> first. Add `.ai-safe/` and `.claude/settings.local*.json` to .gitignore. Ask me before changing
+> scan_ignored.
+
+The agent follows [AGENTS.md](AGENTS.md) and asks before every download. Then run `ai-safe start` and
+`ai-safe open` yourself in a normal terminal.
+
+Those two commands are yours, not the agent's: `start` reads your real repository, and `open` starts the AI
+session on the verified workspace. Inside the workspace the AI works freely. When you want the latest
+state of your repository again, run `ai-safe resync` (after `ai-safe integrate`, or with `--discard`).
 
 ---
 
@@ -48,6 +66,8 @@ Developer repo → discovery → classification → sanitization → AI workspac
 | Sanitize | `ai-safe sanitize` | A private (0700) workspace outside the repository. Credentials become `${AI_SAFE_SECRET_<NAME>}` placeholders. `.env` files, keys and credential stores are excluded. No `.git`. |
 | Verify | `ai-safe verify` | Full re-scan of the workspace: secrets, private keys, symlinks, Git metadata, credential files, binaries, hard links, and known original values matched by keyed fingerprint. Exits non-zero on any problem. |
 | Start | `ai-safe start` | Scan, sanitize and verify in one step, then print a security summary and launch instructions. If verification fails, the workspace is deleted (fail closed). |
+| Open | `ai-safe open` | Menu to open the verified workspace in an AI agent CLI, VSCode or a Docker container, or to print the commands. Launches only on your menu choice and only with `security.allow_ai_launch: true`. |
+| Resync | `ai-safe resync` | Rebuild the workspace from the current repository in place (same path), verified in a staging directory before anything reaches the live workspace. |
 | Review | `ai-safe review` | Diff of the workspace against a pristine snapshot kept outside it. Flags hardcoded credentials, placeholder misuse, sensitive-file and `.gitignore` changes, symlinks and hard links, files in ignored paths, hidden control characters, and conflicts. |
 | Integrate | `ai-safe integrate` | Applies the reviewed changes to the original repository after path validation, a final scan and your typed approval. Credentials are preserved. Nothing is committed or pushed. |
 | Cleanup | `ai-safe cleanup` | Securely deletes workspaces, snapshots and mappings. |
@@ -203,6 +223,12 @@ ai-safe verify
 # Start AI-safe workflow
 ai-safe start
 
+# Open the verified workspace (AI agent CLI, VSCode, Docker, or print the commands)
+ai-safe open
+
+# Rebuild the workspace from the current repository, same path
+ai-safe resync
+
 # Review AI changes
 ai-safe review
 
@@ -216,6 +242,8 @@ ai-safe integrate
 | `ai-safe sanitize [PATH]` | `--history-summary` | 0 · 3 error |
 | `ai-safe verify` | `--session ID`, `--workspace DIR`, `-o report.json` | 0 pass · 1 fail |
 | `ai-safe start [PATH]` | `--history-summary`, `--launch` (needs `security.allow_ai_launch`) | 0 ready · 1 verification failed |
+| `ai-safe open` | `--session ID`, `-c ai-safe.yaml` | 0 launched or printed · 1 workspace unverified or missing · 2 no TTY, no valid choice, or Docker image not set · 3 refused inside an AI agent session, or the launch failed |
+| `ai-safe resync` | `--session ID`, `-c ai-safe.yaml`, `--discard` (also asks you to type `discard`) | 0 resynced · 1 pending changes, verification failed or not confirmed · 3 refused inside an AI agent session |
 | `ai-safe review` | `--session ID`, `-o report.json` | 0 pass · 1 blocking issues |
 | `ai-safe integrate` | `--dry-run`, `--exclude PATH` (repeatable), `--session ID` | 0 applied/dry run · 1 refused |
 | `ai-safe cleanup` | `--session ID`, `--all`, `--yes` | 0 |
@@ -227,6 +255,21 @@ ai-safe integrate
 
 Exit code `2` means invalid configuration or usage. Exit code `3` means an operational error, which always
 fails closed.
+
+**`ai-safe open`** never launches anything on its own. With `security.allow_ai_launch: false` (the
+default) it prints the commands and exits. Otherwise it shows a menu: (1) the AI agent CLI
+(`security.launch_command`), (2) VSCode (`code -n <workspace>`), (3) Docker (`security.docker_image`, which
+mounts only the workspace; without an image or without `docker` on PATH it prints an example command),
+(4) print the commands only. The launched process gets only the `security.launch_env_allowlist` variables
+plus `AI_SAFE_AGENT=1`. It refuses inside an AI agent session and on a workspace that has not passed
+verification.
+
+**`ai-safe resync`** builds and verifies a fresh workspace in a staging directory next to the current one,
+then swaps the session state and the workspace contents in place. The workspace keeps its path, so an
+editor window stays valid, but close any AI session in it first. Any failure leaves the old workspace and
+the session state untouched. It runs without `--discard` only when the workspace has no changes since the
+snapshot, or is exactly what you last integrated in full. Otherwise integrate first, or pass `--discard`
+and type `discard` to throw the changes away. It refuses inside an AI agent session.
 
 `verify`, `review` and `mapping` find their session automatically, either from the workspace marker (when
 run inside a workspace) or from the latest session for the current repository.
@@ -248,8 +291,9 @@ secret values.
 - `.claude/skills/ai-safe-scan`, `-sanitize`, `-review`, `-integrate`, `-security-audit`: reusable skills.
   Each documents purpose, execution boundaries, expected inputs, outputs and failure conditions.
 - `.claude/settings.json`: `permissions.deny` rules for `.env*`, the marker, the ai-safe state directory,
-  `git push`, `ai-safe integrate` and `ai-safe cleanup`. The original repository path is deliberately not
-  written into the workspace.
+  `git push`, `ai-safe integrate` and `ai-safe cleanup`, merged with the allowlisted parts of your team's
+  `.claude/settings.json` (see [Configuration](#configuration)). The original repository path is
+  deliberately not written into the workspace.
 - `AI_SAFE_PLACEHOLDERS.md`: placeholder names, categories and files. No values.
 
 The same skills are in [`skills/`](skills/). Install them anywhere with `ai-safe skills install <dir>`.
@@ -322,16 +366,43 @@ security:
   reject_symlinks: true
   store_secret_values: false  # true: also keep scrypt+Fernet-encrypted values (needs a passphrase)
   encrypt_mapping: true
-  allow_ai_launch: false
+  allow_ai_launch: false      # true: `ai-safe open` may launch on your menu choice (never automatically)
   launch_command: ["claude"]
+  # docker_image: <image-with-claude-code>   # used by `ai-safe open` option 3; mounts only the workspace
 ```
+
+`scanner.scan_ignored: false` together with `sanitization.include_ignored_files: true` is rejected, because
+ignored files would be copied without being scanned. An AI agent must ask you before changing
+`scan_ignored`, and must not open ignored files to decide.
 
 **Mandatory exclusions.** These are always applied, whatever the config says: `.git/`, `.env`, `.env.*`,
 `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `*.kdbx`, `*.ppk`, `id_rsa*`, `id_dsa*`,
 `id_ecdsa*`, `id_ed25519*`, `.ssh/`, `.gnupg/`, `.aws/`, `.azure/`, `.kube/`, `.docker/`, `.netrc`,
 `.pgpass`, `.git-credentials`, `.npmrc`, `.pypirc`, `.htpasswd`, `credentials.json`, `*.tfstate*`,
-`*.tfvars` and `.claude/`. Patterns are matched case-insensitively. `name/` matches a directory anywhere in
-the path. Patterns containing `/` match the full path. Other patterns match any path component.
+`*.tfvars`, `.claude/`, `.ai-safe/` and `.claude/ai-safe/`. Patterns are matched case-insensitively.
+`name/` matches a directory anywhere in the path. Patterns containing `/` match the full path. Other
+patterns match any path component.
+
+**The `.claude/` directory.** A few team paths are carved out of the `.claude/` exclusion; everything else
+stays excluded:
+
+- `.ai-safe/` (a local install) and `.claude/ai-safe/` are never scanned and never copied. Any workspace
+  change under them blocks integration (`ai-safe-install`).
+- ai-safe's own skills (`.claude/skills/ai-safe*/`) are never copied; the workspace regenerates them from
+  the templates. The scanner skips them only while they are byte-identical to the current template.
+- The team's `.claude/skills/**`, `.claude/commands/**` and `.claude/agents/**` are scanned, redacted and
+  copied like any other file. AI changes to them are integrated, but each one carries a WARNING
+  `agent-instructions` and appears in the approval diff, because they steer future AI sessions in your
+  repository. Read them in full.
+- The team's `.claude/settings.json` is redacted and merged into the generated settings through an
+  allowlist: `permissions.allow|ask|deny`, `model`, `includeCoAuthoredBy`, `cleanupPeriodDays`,
+  `outputStyle`, `alwaysThinkingEnabled` and `spinnerTipsEnabled`. Everything else (hooks, `env`,
+  credential helpers, MCP servers, …) is dropped, and ai-safe's deny rules always win. If the merged text
+  still contains a known secret, only the generated settings are written. It is never integrated back.
+- Every other `.claude/` path, including `settings.local*.json`, stays excluded.
+
+Recommended `.gitignore` entries for a project that uses ai-safe: `.ai-safe/` and
+`.claude/settings.local*.json`.
 
 **Environment variables.** `AI_SAFE_STATE_DIR` sets the state root. `AI_SAFE_WORKSPACE_BASE` sets the
 workspace parent. `AI_SAFE_GITLEAKS` sets the Gitleaks binary. `AI_SAFE_MAPPING_PASSPHRASE` sets the
@@ -422,7 +493,8 @@ passphrase for encrypted values. `AI_SAFE_DEBUG=1` shows tracebacks.
   unrestricted shell access, can read anything you can. Skills, `.claude/settings.json` and the
   agent-environment check are defense in depth only.
 - **The environment is not sanitized.** Your shell environment (for example `AWS_*` variables) is visible
-  to an agent you start yourself. `start --launch` passes only `security.launch_env_allowlist`.
+  to an agent you start yourself. `ai-safe open` and `start --launch` pass only
+  `security.launch_env_allowlist` (plus `AI_SAFE_AGENT=1`).
 - **Merge commits.** Diffs of merge commits are not inspected by the built-in history scan. That is the
   `git log -p` default; Gitleaks behaves the same way.
 - **Secure deletion is best effort.** Overwriting files does not guarantee erasure on SSDs, copy-on-write
@@ -479,7 +551,7 @@ ai-safe start
 #   History   : original .git NOT copied; 7 credential(s) found in history - ROTATE THEM
 
 # 3. Work with the agent inside the workspace only (ideally in a container)
-cd /tmp/ai-safe-ws-abc123 && claude
+ai-safe open                     # or yourself: cd /tmp/ai-safe-ws-abc123 && claude
 #   app/settings.py:  OPENAI_API_KEY = "${AI_SAFE_SECRET_OPENAI_API_KEY}"
 #   The agent replaces it with os.environ["OPENAI_API_KEY"] and adds a feature.
 
@@ -493,7 +565,10 @@ ai-safe integrate                # type 'apply'
 git diff                         # credentials untouched except where the AI removed a hardcoded one
 git commit -am "..."             # your decision; ai-safe never commits or pushes
 
-# 6. Clean up
+# 6. Later: refresh the workspace from your repository (same path; close the AI session first)
+ai-safe resync
+
+# 7. Clean up
 ai-safe cleanup --yes
 ```
 

@@ -32,9 +32,19 @@ anything that must not reach the original repository.
    - `symlink`, `unexpected-binary`, `unsafe-path`: remove the offending file.
    - `conflict`: explain it to the developer. They will apply that hunk manually.
    - `sensitive-config` (warning): mention it explicitly in your hand-off summary.
+   - `agent-instructions` (warning): you changed a team skill, command or agent under
+     `.claude/`. List each one in your hand-off; the developer reviews them before integration.
+   - `ai-safe-install`: revert every change under `.ai-safe/` or `.claude/ai-safe/`.
 3. Re-run `ai-safe review` until it passes, then run `ai-safe verify`.
 4. Hand off with: summary of changes, warnings, placeholder requirements, and the
    instruction that the **developer** runs `ai-safe integrate`.
+
+## When `ai-safe` is not available
+If `command -v ai-safe` fails, or `ai-safe review` reports that no session was found (for
+example inside Docker, or when ai-safe was installed locally in the original repository), do
+not install ai-safe and do not search for it. Finish the work, and in your hand-off give the
+developer these commands to run on the host, inside the workspace path: `ai-safe verify` and
+`ai-safe review`.
 
 ## Outputs
 - Terminal report and `reports/review.json` in the session state directory.

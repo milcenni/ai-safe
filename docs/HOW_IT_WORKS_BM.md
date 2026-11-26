@@ -160,6 +160,50 @@ menolak untuk berjalan jika ia dikesan dijalankan oleh AI agent. Ia:
 - **tidak membuat commit dan tidak membuat push**. Developer menyemak `git diff` dan membuat commit
   sendiri.
 
+### Folder `.claude/` pasukan
+
+- `.ai-safe/` dan `.claude/ai-safe/` tidak pernah di-scan dan tidak pernah disalin. Sebarang perubahan
+  di bawahnya dalam workspace **menyekat** integrasi (`ai-safe-install`).
+- Skill ai-safe sendiri dijana semula daripada templat, bukan disalin.
+- Skill, command dan agent pasukan (`.claude/skills|commands|agents/`) di-scan, di-redact dan disalin.
+  Perubahan AI pada fail ini boleh diintegrasi, tetapi sentiasa disertai **AMARAN** `agent-instructions`
+  dan dipaparkan dalam diff kelulusan, kerana ia mengarahkan sesi AI akan datang dalam repo asal. Baca
+  dengan teliti.
+- `.claude/settings.json` pasukan digabungkan ke dalam tetapan yang dijana melalui *allowlist* sahaja
+  (`permissions`, `model` dan beberapa kunci selamat). Kunci berbahaya seperti hooks, `env` dan pelayan
+  MCP dibuang, dan peraturan *deny* ai-safe sentiasa menang. Fail ini tidak pernah diintegrasi semula.
+  Laluan `.claude/` yang lain (termasuk `settings.local*.json`) kekal dikecualikan.
+
+---
+
+## 4a. `ai-safe open` dan `ai-safe resync`
+
+### `ai-safe open`
+
+Membuka workspace yang telah disahkan melalui menu: (1) AI agent CLI, (2) VSCode, (3) Docker yang hanya
+mount workspace, atau (4) papar arahan sahaja. Ia:
+
+- **tidak pernah** melancarkan apa-apa secara automatik. Ia melancar hanya selepas developer memilih
+  dari menu, dan hanya jika `security.allow_ai_launch: true`. Jika tidak, ia hanya memaparkan arahan,
+- menolak untuk berjalan dalam sesi AI agent, dan menolak workspace yang belum lulus verify,
+- hanya menghantar pembolehubah persekitaran dalam `launch_env_allowlist` (serta `AI_SAFE_AGENT=1`)
+  kepada proses yang dilancarkan.
+
+### `ai-safe resync`
+
+Membina semula workspace daripada repo asal terkini, di **lokasi yang sama**. Workspace baru dibina dan
+disahkan dalam folder *staging* dahulu; tiada satu bait pun sampai ke workspace sebenar sebelum verify
+lulus. Jika apa-apa gagal, workspace lama dan state sesi kekal tidak berubah. Tutup sesi AI dalam
+workspace sebelum resync. Jika workspace masih ada perubahan yang belum diintegrasi, resync menolak:
+jalankan `ai-safe integrate` dahulu, atau `ai-safe resync --discard` dan taip `discard` untuk membuang
+perubahan itu. Arahan ini juga menolak untuk berjalan dalam sesi AI agent.
+
+### Konfigurasi
+
+`scanner.scan_ignored: false` bersama `sanitization.include_ignored_files: true` ditolak, kerana fail yang
+di-ignore akan disalin tanpa di-scan. AI mesti bertanya kepada developer sebelum menukar `scan_ignored`,
+dan tidak boleh membuka fail yang di-ignore untuk membuat keputusan.
+
 ---
 
 ## 5. Had yang perlu diketahui
@@ -174,7 +218,7 @@ menolak untuk berjalan jika ia dikesan dijalankan oleh AI agent. Ia:
    **Isolasi sebenar memerlukan salah satu daripada:**
    - menjalankan AI dalam **container** yang hanya mount folder workspace, atau
    - menjalankan AI sebagai **user OS yang berasingan**.
-3. **Jangan jalankan `ai-safe start` melalui AI** dalam repo asal, kerana AI itu sudah mempunyai akses ke
+3. **Jangan jalankan `ai-safe start`, `open` atau `resync` melalui AI** dalam repo asal, kerana AI itu sudah mempunyai akses ke
    repo asal. Developer patut menjalankannya sendiri di terminal.
 4. **Credential yang pernah di-commit ke Git dianggap sudah terdedah.** ai-safe akan memberi amaran,
    tetapi credential itu **mesti di-rotate** (ditukar). Membersihkan workspace tidak memadam sejarah
@@ -192,7 +236,7 @@ menolak untuk berjalan jika ia dikesan dijalankan oleh AI agent. Ia:
 ai-safe start                            # scan → bersihkan → verify → papar lokasi workspace
 
 # 3. Buka AI dalam workspace sahaja
-cd <lokasi-workspace> && claude
+ai-safe open                             # atau sendiri: cd <lokasi-workspace> && claude
 
 # 4. Selepas AI siap
 ai-safe review                           # semakan automatik
@@ -201,7 +245,10 @@ ai-safe review                           # semakan automatik
 ai-safe integrate                        # taip 'apply' untuk luluskan
 git diff                                 # semak, kemudian commit sendiri
 
-# 6. Bersihkan
+# 6. Kemudian: kemas kini workspace daripada repo asal (lokasi sama; tutup sesi AI dahulu)
+ai-safe resync
+
+# 7. Bersihkan
 ai-safe cleanup
 ```
 

@@ -28,7 +28,8 @@ Before doing anything else:
 
 1. Check that `.ai-safe-workspace.json` exists in the workspace root.
 2. If it does not exist, **stop** and tell the user: "This is not an ai-safe workspace.
-   Run `ai-safe start` in the original repository and open the printed workspace path."
+   Run `ai-safe start` and then `ai-safe open` in your own terminal, in the original
+   repository." Do not run either command yourself.
 3. Treat the directory containing `.ai-safe-workspace.json` as the only directory you may
    read, search or modify.
 
@@ -88,7 +89,22 @@ ai-safe review     # AI changes: hardcoded credentials, placeholder misuse, sens
 
 If either command fails, fix the reported issues in the workspace (for example, replace a
 hardcoded value with an environment lookup), then run both again. If the `ai-safe` command
-is not available, say so; do not skip the step silently.
+is not available, follow section 6; do not skip the step silently.
+
+Team skills, commands and agents you edit here (`.claude/skills/`, `.claude/commands/`,
+`.claude/agents/`, other than the ai-safe skills) will be shown to the developer for review
+before integration, because they steer future AI sessions in the original repository.
+
+## 6. When `ai-safe` is not available
+
+If `command -v ai-safe` fails, or `ai-safe verify` reports that no session was found (for
+example inside Docker, or when ai-safe was installed locally in the original repository), the
+checks can only run on the host. Then:
+
+- Do not install ai-safe and do not search for it (no `pip install`, no looking for its
+  installation directory, no reading paths outside this workspace).
+- Finish the work, and in your hand-off give the developer these commands to run on the host,
+  inside the workspace path: `ai-safe verify` and `ai-safe review`.
 
 ## Failure conditions: stop and tell the user
 

@@ -78,6 +78,11 @@ See README "Security limitations". In short:
 - Secure deletion is best effort.
 - Merge-commit diffs are not inspected by the built-in history scan.
 - Short values are replaced only where they were detected.
+- AI changes to the team's `.claude/skills|commands|agents/**` are integrated after review. The
+  `agent-instructions` warning flags them, but only the developer's reading of the diff stops a planted
+  instruction.
+- The skills' "do not install ai-safe" fallback (inside Docker or with a local install) is guidance only;
+  `verify` and `review` must then be run on the host by the developer.
 
 ## 6. Security review (implementation phase)
 

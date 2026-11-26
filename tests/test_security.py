@@ -255,7 +255,7 @@ def test_main_skill_covers_required_rules():
     t = skill_template("ai-safe").lower()
     for phrase in (".ai-safe-workspace.json", "never request", "parent directories", "outside this workspace",
                    "environment", "hardcode", ".env", "recover", "ai-safe verify", "placeholder requirement",
-                   "not a security boundary"):
+                   "not a security boundary", "ai-safe open", "do not install ai-safe", "run on the host"):
         assert phrase in t, phrase
 
 
