@@ -420,7 +420,7 @@ def open_cmd(
         c.print(opt.example, markup=False)
         c.print("Docker was not run: set security.docker_image (and make sure `docker` is on PATH).")
         raise typer.Exit(EXIT_USAGE)
-    rc = launcher.run_option(opt, ws, launcher.launch_env(cfg))
+    rc = launcher.run_option(opt, ws, launcher.option_env(opt, cfg))
     if rc != 0:
         c.print(f"[yellow]{opt.label} exited with code {rc}.[/yellow] Run it yourself:", highlight=False)
         c.print(opt.example, markup=False)

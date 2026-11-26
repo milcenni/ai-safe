@@ -263,7 +263,9 @@ default) it prints the commands and exits. Otherwise it shows a menu: (1) the AI
 (`security.launch_command`), (2) VSCode (`code -n <workspace>`), (3) Docker (`security.docker_image`, which
 mounts only the workspace; without an image or without `docker` on PATH it prints an example command),
 (4) print the commands only. The launched process gets only the `security.launch_env_allowlist` variables
-plus `AI_SAFE_AGENT=1`. It refuses inside an AI agent session, on a workspace that has not passed
+plus `AI_SAFE_AGENT=1`. VSCode alone also gets the display and session variables it needs on Linux and WSL
+when they are set (`DISPLAY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`,
+`WSL_DISTRO_NAME`, `WSL_INTEROP`, `WSLENV`); the agent CLI and Docker never do. It refuses inside an AI agent session, on a workspace that has not passed
 verification (or whose last verification failed), and while a resync is unfinished.
 
 **`ai-safe resync`** builds and verifies a fresh workspace in a staging directory next to the current one,

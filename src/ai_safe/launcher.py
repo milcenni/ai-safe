@@ -40,6 +40,20 @@ def launch_env(cfg: AISafeConfig) -> dict[str, str]:
     return env
 
 
+# VSCode (an Electron GUI) cannot start on Linux/WSL without its display/session variables.
+# They locate the display and session bus; they are not credentials. Agent and Docker never get them.
+VSCODE_ENV_VARS = ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+                   "WSL_DISTRO_NAME", "WSL_INTEROP", "WSLENV")
+
+
+def option_env(opt: LaunchOption, cfg: AISafeConfig) -> dict[str, str]:
+    """The environment for ``opt``: :func:`launch_env`, plus ``VSCODE_ENV_VARS`` (when set) for vscode only."""
+    env = launch_env(cfg)
+    if opt.key == "vscode":
+        env.update({k: os.environ[k] for k in VSCODE_ENV_VARS if k in os.environ})
+    return env
+
+
 def _join(argv: list[str]) -> str:
     return " ".join(a if a == IMAGE_PLACEHOLDER else shlex.quote(a) for a in argv)
 

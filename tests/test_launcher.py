@@ -196,3 +196,37 @@ def test_open_invalid_choice_launches_nothing(project_allow_launch, monkeypatch)
     monkeypatch.setattr(launcher, "is_interactive", lambda: True)
     r = _open(project_allow_launch, monkeypatch, input="9\n")
     assert r.exit_code == 2, r.output
+
+
+GUI_VARS = {"DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0", "XDG_RUNTIME_DIR": "/run/user/1000",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus", "WSL_DISTRO_NAME": "Ubuntu",
+            "WSL_INTEROP": "/run/WSL/1_interop", "WSLENV": "X/p"}
+
+
+def test_open_vscode_env_keeps_display_and_wsl_vars(project_allow_launch, monkeypatch):
+    for k, v in GUI_VARS.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("SOME_TOKEN", "x")
+    rec = Recorder()
+    monkeypatch.setattr(launcher.subprocess, "run", rec)
+    monkeypatch.setattr(launcher, "is_interactive", lambda: True)
+    r = _open(project_allow_launch, monkeypatch, input="2\n")
+    assert r.exit_code == 0, r.output
+    (argv, kw), = rec.calls
+    assert argv[0] == "code"
+    for k, v in GUI_VARS.items():
+        assert kw["env"][k] == v
+    assert kw["env"]["AI_SAFE_AGENT"] == "1" and "SOME_TOKEN" not in kw["env"]
+
+
+def test_open_agent_env_has_no_display_or_wsl_vars(project_allow_launch, monkeypatch):
+    for k, v in GUI_VARS.items():
+        monkeypatch.setenv(k, v)
+    rec = Recorder()
+    monkeypatch.setattr(launcher.subprocess, "run", rec)
+    monkeypatch.setattr(launcher, "is_interactive", lambda: True)
+    r = _open(project_allow_launch, monkeypatch, input="1\n")
+    assert r.exit_code == 0, r.output
+    (argv, kw), = rec.calls
+    assert argv == ["claude"]
+    assert not set(GUI_VARS) & set(kw["env"])
