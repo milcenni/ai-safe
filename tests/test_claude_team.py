@@ -382,6 +382,24 @@ def test_integrated_tree_hash_recorded_only_without_exclude(team_project, exclud
     assert loaded.integrated_tree_hash == (None if excluded else tree_hash(p.ws))
 
 
+def test_integrated_tree_hash_cleared_if_workspace_changed_during_approval(team_project):
+    from ai_safe.integration import integrate
+    from ai_safe.workspace import Session
+    p = team_project
+    (p.ws / "app/util.py").write_text("def add(a, b):\n    return b + a\n")
+
+    def confirm_while_ai_edits(rr, patch):
+        (p.ws / "app/late.py").write_text("UNREVIEWED = 1\n")  # AI keeps working during approval
+        return True
+
+    res = integrate(p.session, p.cfg, p.scanner, confirm=confirm_while_ai_edits, cwd=p.repo)
+    assert not res.aborted, res.reason
+    assert res.applied == ["app/util.py"]
+    loaded = Session.load(p.session.state_path)
+    assert loaded.status == "integrated"
+    assert loaded.integrated_tree_hash is None
+
+
 def test_session_without_integrated_tree_hash_loads(team_project):
     from ai_safe.workspace import Session
     state = team_project.session.state_path

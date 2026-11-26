@@ -144,6 +144,8 @@ def integrate(
     guard_human_context(session, Path(cwd or os.getcwd()))
     repo = session.repo_path
     result = IntegrationResult()
+    # Hash before review: integrated_tree_hash must describe the reviewed workspace, not later AI edits.
+    reviewed_hash = tree_hash(session.workspace_path)
     review = review_session(session, cfg, scanner, exclude_paths=exclude_paths)
     result.review = review
     if not review.passed:
@@ -196,7 +198,9 @@ def integrate(
         atomic_write(target, p.content, p.mode or 0o644)
         result.applied.append(p.path)
     session.status = "integrated"
-    # Only a full integration means "workspace == what the developer accepted" (resync relies on it).
-    session.integrated_tree_hash = tree_hash(session.workspace_path) if not exclude_paths else None
+    # Only a full integration of an unchanged workspace means "workspace == what the developer
+    # accepted" (resync relies on it). Any edit during review/approval clears it.
+    unchanged = tree_hash(session.workspace_path) == reviewed_hash
+    session.integrated_tree_hash = reviewed_hash if unchanged and not exclude_paths else None
     session.save()
     return result
