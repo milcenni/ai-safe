@@ -170,12 +170,68 @@ def test_team_skill_secret_redacted(make_repo, fake):
 
 def test_team_settings_secret_redacted_before_merge(make_repo, fake):
     secret = fake.openai()
-    repo = make_repo({".claude/settings.json": json.dumps({"model": "opus", "note": f'API_KEY = "{secret}"'})})
+    team = {"model": "opus", "permissions": {"allow": [f"Bash(curl -H 'X-Key: {secret}' localhost)"]}}
+    repo = make_repo({".claude/settings.json": json.dumps(team)})
     p = prepare(repo)
     raw = (p.ws / ".claude" / "settings.json").read_text()
     assert secret not in raw
     assert _ws_settings(p)["model"] == "opus"
     assert p.verification.passed, p.verification.issues
+
+
+def _json_escape_all(value: str) -> str:
+    # Every character as a \uXXXX escape: valid JSON, invisible to text detectors before decoding.
+    return "".join(f"\\u{ord(c):04x}" for c in value)
+
+
+@pytest.mark.parametrize("known_elsewhere", [False, True])
+def test_team_settings_json_escaped_secret_fails_closed(make_repo, fake, known_elsewhere):
+    secret = fake.openai()
+    raw = '{"model": "opus", "permissions": {"allow": ["Bash(curl -H \'X-Key: ' + _json_escape_all(secret) + '\' localhost)"]}}'
+    assert secret not in raw and json.loads(raw)["model"] == "opus"
+    files = {".claude/settings.json": raw}
+    if known_elsewhere:
+        files["app.py"] = f'OPENAI_API_KEY = "{secret}"\n'
+    p = prepare(make_repo(files))
+    written = (p.ws / ".claude" / "settings.json").read_text()
+    assert secret not in written and _json_escape_all(secret) not in written
+    assert _ws_settings(p) == _gen_settings(p)
+    e = _entry(p, ".claude/settings.json")
+    assert e.action == "excluded" and "not merged" in e.reason
+    assert secret not in e.reason
+    assert p.verification.passed, p.verification.issues
+
+
+@pytest.mark.parametrize("team", [
+    {"enabledPlugins": {"x@y": True}},
+    {"extraKnownMarketplaces": {"m": {"source": {"source": "github", "repo": "a/b"}}}},
+    {"sandbox": {"enabled": False}},
+    {"permissions": {"defaultMode": "bypassPermissions"}},
+    {"permissions": {"additionalDirectories": ["../orig"]}},
+    {"mcpServers": {"s": {"command": "x"}}},
+    {"enableAllProjectMcpServers": True},
+    {"fileSuggestion": {"command": "x"}},
+    {"hooks": {"PreToolUse": []}},
+    {"env": {"A": "1"}},
+    {"someFutureKey": 1},
+])
+def test_merge_settings_allowlist_drops_other_keys(team):
+    gen = claude_settings(Path("/tmp/state"))
+    m = merge_claude_settings(team, gen)
+    assert set(m) == {"_comment", "permissions"}
+    assert set(m["permissions"]) == {"deny"}
+
+
+def test_merge_settings_allowlist_keeps_allowed_keys():
+    gen = claude_settings(Path("/tmp/state"))
+    team = {"model": "opus", "includeCoAuthoredBy": False, "cleanupPeriodDays": 7, "outputStyle": "x",
+            "alwaysThinkingEnabled": True, "spinnerTipsEnabled": False,
+            "permissions": {"allow": ["Bash(npm test)"], "ask": ["Bash(rm:*)"], "deny": ["Read(./x)"]}}
+    m = merge_claude_settings(team, gen)
+    for k in ("model", "includeCoAuthoredBy", "cleanupPeriodDays", "outputStyle", "alwaysThinkingEnabled", "spinnerTipsEnabled"):
+        assert m[k] == team[k], k
+    assert m["permissions"]["allow"] == ["Bash(npm test)"] and m["permissions"]["ask"] == ["Bash(rm:*)"]
+    assert m["permissions"]["deny"][0] == "Read(./x)"
 
 
 def test_invalid_team_settings_json_excluded(make_repo):

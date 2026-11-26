@@ -27,6 +27,7 @@ from pathlib import Path
 from ai_safe import git_history as gh
 from ai_safe.classifier import ClaudePath, claude_path_policy, sensitive_match
 from ai_safe.config import AISafeConfig
+from ai_safe.detectors import PRIVATE_KEY_HEADER, PUTTY_KEY
 from ai_safe.credential_map import CredentialMap
 from ai_safe.models import WORKING_TREE_LOCATIONS, Finding, Location
 from ai_safe.redaction import CHECK_MIN_LEN, PlaceholderRegistry, RedactionError, redact_text
@@ -36,6 +37,7 @@ from ai_safe.security import (
     SecurityError,
     is_binary,
     is_git_metadata_path,
+    is_placeholder_value,
     keyed_digest,
     safe_file_mode,
     safe_relpath,
@@ -47,9 +49,13 @@ from ai_safe.security import (
 from ai_safe.workspace import (
     HISTORY_SUMMARY_FILE,
     PLACEHOLDERS_FILE,
+    CLAUDE_SETTINGS,
     Session,
+    claude_settings,
+    claude_settings_text,
     generated_paths,
     install_claude_integration,
+    merge_claude_settings,
     take_snapshot,
 )
 
@@ -138,6 +144,8 @@ class Sanitizer:
             entries.append(self._process(root, ws, rel, by_file.get(rel, []), registry, global_secrets))
 
         warnings = self._final_sweep(ws, entries, registry)
+        state_root_path = Path(session.state_dir).parent.parent
+        warnings += self._sweep_merged_settings(state_root_path, entries, registry, global_secrets)
 
         if self.cfg.sanitization.history_summary and scan.is_git:
             text = history_summary(root, self.scanner, registry, self.cfg.sanitization.history_summary_max_commits)
@@ -147,7 +155,7 @@ class Sanitizer:
         cmap = CredentialMap.from_registry(registry)
         placeholders_doc = _placeholders_doc(cmap)
         write_private_file(ws / PLACEHOLDERS_FILE, placeholders_doc, mode=0o644)
-        install_claude_integration(ws, Path(session.state_dir).parent.parent, self.cfg, self._team_settings)
+        install_claude_integration(ws, state_root_path, self.cfg, self._team_settings)
 
         cmap.save(session.state_path, registry, store_secret_values=self.cfg.security.store_secret_values, passphrase=passphrase)
         manifest = {
@@ -260,6 +268,38 @@ class Sanitizer:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
         os.chmod(dst, mode)
+
+    def _sweep_merged_settings(self, state_root_path: Path, entries: list[ManifestEntry],
+                               registry: PlaceholderRegistry, global_secrets: list[str]) -> list[str]:
+        """Check the exact merged settings text before it is written.
+
+        Redaction ran on the raw team JSON; decoding (``\\uXXXX``, ``\\/``) and
+        re-serialising can surface values that redaction never saw. Any known
+        secret value or detector hit in the final text drops the team settings
+        (generated-only settings are written instead) - fail closed.
+        """
+        if self._team_settings is None:
+            return []
+        merged = merge_claude_settings(self._team_settings, claude_settings(state_root_path))
+        written = claude_settings_text(merged)
+        decoded = json.dumps(merged, indent=2, ensure_ascii=False)
+        known = {e.secret for e in registry.entries() if len(e.secret) >= CHECK_MIN_LEN}
+        known |= {s for s in global_secrets if len(s) >= CHECK_MIN_LEN}
+        hit = False
+        for text in (written, decoded):
+            if any(s in text for s in known) or PRIVATE_KEY_HEADER.search(text) or PUTTY_KEY.search(text):
+                hit = True
+            elif any(not is_placeholder_value(m.secret) for m in self.scanner.detector.scan_text(text, CLAUDE_SETTINGS)):
+                hit = True
+        if not hit:
+            return []
+        self._team_settings = None
+        for e in entries:
+            if e.action == "merged":
+                e.action = "excluded"
+                e.reason = "credential-like value in merged .claude/settings.json - fail closed (not merged)"
+                e.replacements, e.placeholders = 0, []
+        return [f"{CLAUDE_SETTINGS}: team settings not merged (credential-like value after JSON decoding)"]
 
     def _final_sweep(self, ws: Path, entries: list[ManifestEntry], registry: PlaceholderRegistry) -> list[str]:
         """Remove any written file that still contains a known secret value."""

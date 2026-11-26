@@ -331,31 +331,31 @@ def claude_settings(state_root_path: Path) -> dict:
     }
 
 
-# Team settings keys that run commands, inject environment, reach credentials or
-# widen the agent's filesystem view. They are never carried into the workspace.
-DROPPED_SETTINGS_KEYS = (
-    "hooks", "env", "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport",
-    "otelHeadersHelper", "statusLine", "enabledMcpjsonServers",
+# Allowlist: only these team settings are carried into the workspace. Everything
+# else (hooks, env, credential helpers, plugins, MCP servers, sandbox, defaultMode,
+# additionalDirectories, unknown/future keys, ...) is dropped.
+ALLOWED_SETTINGS_KEYS = (
+    "model", "includeCoAuthoredBy", "cleanupPeriodDays", "outputStyle",
+    "alwaysThinkingEnabled", "spinnerTipsEnabled",
 )
+ALLOWED_PERMISSION_KEYS = ("allow", "ask", "deny")
 
 
 def merge_claude_settings(team: dict | None, generated: dict) -> dict:
     """Merge the team's ``.claude/settings.json`` into ai-safe's generated settings.
 
-    ai-safe's deny rules always win: dangerous top-level keys and
-    ``permissions.additionalDirectories`` are dropped, the generated deny list is
-    appended to the team's, and any ``allow``/``ask`` entry that the generated
-    deny list names is removed. Neither input is mutated.
+    Only allowlisted keys survive (``ALLOWED_SETTINGS_KEYS`` and
+    ``permissions.allow|ask|deny``). ai-safe's deny rules always win: the generated
+    deny list is appended to the team's, and any ``allow``/``ask`` entry that the
+    generated deny list names is removed. Neither input is mutated.
     """
     if not isinstance(team, dict):
         return copy.deepcopy(generated)
-    merged = copy.deepcopy(team)
-    for key in DROPPED_SETTINGS_KEYS:
-        merged.pop(key, None)
-    perms = merged.get("permissions")
-    perms = perms if isinstance(perms, dict) else {}
-    perms.pop("additionalDirectories", None)
-    gen_deny = [d for d in generated.get("permissions", {}).get("deny", [])]
+    merged = {k: copy.deepcopy(team[k]) for k in ALLOWED_SETTINGS_KEYS if k in team}
+    team_perms = team.get("permissions")
+    team_perms = team_perms if isinstance(team_perms, dict) else {}
+    perms = {k: copy.deepcopy(team_perms[k]) for k in ALLOWED_PERMISSION_KEYS if k in team_perms}
+    gen_deny = list(generated.get("permissions", {}).get("deny", []))
     team_deny = perms.get("deny")
     team_deny = [d for d in team_deny if isinstance(d, str)] if isinstance(team_deny, list) else []
     deny: list[str] = []
@@ -377,6 +377,11 @@ def merge_claude_settings(team: dict | None, generated: dict) -> dict:
     return merged
 
 
+def claude_settings_text(settings: dict) -> str:
+    """The exact text written to the workspace's ``.claude/settings.json``."""
+    return json.dumps(settings, indent=2)
+
+
 def install_claude_integration(ws: Path, state_root_path: Path, cfg: AISafeConfig,
                                team_settings: dict | None = None) -> None:
     if cfg.workspace.install_skills:
@@ -385,7 +390,7 @@ def install_claude_integration(ws: Path, state_root_path: Path, cfg: AISafeConfi
         p = Path(ws) / CLAUDE_SETTINGS
         p.parent.mkdir(parents=True, exist_ok=True)
         settings = merge_claude_settings(team_settings, claude_settings(state_root_path))
-        write_private_file(p, json.dumps(settings, indent=2), mode=0o644)
+        write_private_file(p, claude_settings_text(settings), mode=0o644)
 
 
 # ---------------------------------------------------------------------------
