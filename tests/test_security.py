@@ -106,11 +106,20 @@ def test_secure_remove_tree_does_not_follow_symlinks(tmp_path):
     ({"scanner": {"history_log_opts": "--all -o/tmp/x"}}, "history_log_opts"),
     ({"scanner": {"custom_rules": [{"id": "x1", "regex": "("}]}}, "invalid regex"),
     ({"version": 2}, "version"),
+    ({"scanner": {"scan_ignored": False}, "sanitization": {"include_ignored_files": True}}, "include_ignored_files"),
+    ({"security": {"docker_image": "bad image;rm"}}, "docker_image"),
 ])
 def test_config_validation_rejects_unsafe(snippet, msg):
     with pytest.raises(ConfigError) as exc:
         parse_config({"version": 1, **snippet})
     assert msg in str(exc.value)
+
+
+def test_docker_image_and_install_excludes():
+    cfg = parse_config({"version": 1, "security": {"docker_image": "ghcr.io/acme/claude:1.2"}})
+    assert cfg.security.docker_image == "ghcr.io/acme/claude:1.2"
+    assert ".claude/ai-safe/" in cfg.sanitization.all_excludes()
+    assert ".ai-safe/" in cfg.sanitization.all_excludes()
 
 
 def test_repository_config_template_is_valid():

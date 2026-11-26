@@ -57,6 +57,8 @@ MANDATORY_EXCLUDES: tuple[str, ...] = (
     ".claude/",
     # local ai-safe installation (install.sh --local)
     ".ai-safe/",
+    # ai-safe's own per-project data under .claude/
+    ".claude/ai-safe/",
 )
 
 DEFAULT_EXCLUDES: tuple[str, ...] = (
@@ -242,6 +244,7 @@ class SecurityConfig(_Strict):
     encrypt_mapping: bool = True
     allow_ai_launch: bool = False
     launch_command: list[str] = Field(default_factory=lambda: ["claude"])
+    docker_image: str | None = None
     launch_env_allowlist: list[str] = Field(
         default_factory=lambda: [
             "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "TZ",
@@ -255,6 +258,15 @@ class SecurityConfig(_Strict):
     def _must_be_true(cls, v: bool, info) -> bool:
         if not v:
             raise ValueError(f"security.{info.field_name}=false is not supported")
+        return v
+
+    @field_validator("docker_image")
+    @classmethod
+    def _docker_image(cls, v: str | None) -> str | None:
+        # Allowlist: the value ends up on a docker command line, so it must not
+        # start with "-" (option injection) or contain whitespace/shell metacharacters.
+        if v is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}", v):
+            raise ValueError("invalid image reference (allowed: [A-Za-z0-9][A-Za-z0-9._/:@-]{0,254})")
         return v
 
     @model_validator(mode="after")
@@ -273,6 +285,15 @@ class AISafeConfig(_Strict):
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     integration: IntegrationConfig = Field(default_factory=IntegrationConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+
+    @model_validator(mode="after")
+    def _ignored_files_scanned(self) -> "AISafeConfig":
+        if self.sanitization.include_ignored_files and not self.scanner.scan_ignored:
+            raise ValueError(
+                "sanitization.include_ignored_files=true requires scanner.scan_ignored=true "
+                "(ignored files would be copied unscanned)"
+            )
+        return self
 
 
 class ConfigError(Exception):
@@ -331,6 +352,7 @@ scanner:
   scan_git_history: true
   history_log_opts: "--all" # all reachable branches and tags
   scan_untracked: true
+  # false = files ignored by .gitignore are NOT scanned (then include_ignored_files must stay false)
   scan_ignored: true
   scan_staged: true
   scan_unstaged: true
@@ -379,4 +401,5 @@ security:
   encrypt_mapping: true
   allow_ai_launch: false
   launch_command: ["claude"]
+  # docker_image: ghcr.io/you/claude-code:tag
 """

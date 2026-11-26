@@ -7,6 +7,7 @@ scanner:
   scan_git_history: true
   history_log_opts: "--all" # all reachable branches and tags
   scan_untracked: true
+  # false = files ignored by .gitignore are NOT scanned (then include_ignored_files must stay false)
   scan_ignored: true
   scan_staged: true
   scan_unstaged: true
@@ -55,3 +56,4 @@ security:
   encrypt_mapping: true
   allow_ai_launch: false
   launch_command: ["claude"]
+  # docker_image: ghcr.io/you/claude-code:tag
