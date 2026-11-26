@@ -400,8 +400,10 @@ stays excluded:
 
 - `.ai-safe/` (a local install) and `.claude/ai-safe/` are never scanned and never copied. Any workspace
   change under them blocks integration (`ai-safe-install`).
-- ai-safe's own skills (`.claude/skills/ai-safe*/`) are never copied; the workspace regenerates them from
-  the templates. The scanner skips them only while they are byte-identical to the current template.
+- ai-safe's own skills (`.claude/skills/ai-safe/`, `ai-safe-scan/`, `ai-safe-sanitize/`, `ai-safe-review/`,
+  `ai-safe-integrate/` and `ai-safe-security-audit/`) are never copied; the workspace regenerates them
+  from the templates. The scanner skips them only while they are byte-identical to the current template.
+  Any other skill, even one named like `ai-safe-deploy`, is a team skill.
 - The team's `.claude/skills/**`, `.claude/commands/**` and `.claude/agents/**` are scanned, redacted and
   copied like any other file. AI changes to them are integrated, but each one carries a WARNING
   `agent-instructions` and appears in the approval diff, because they steer future AI sessions in your
@@ -409,7 +411,9 @@ stays excluded:
 - The team's `.claude/settings.json` is redacted and merged into the generated settings through an
   allowlist: `permissions.allow|ask|deny`, `model`, `includeCoAuthoredBy`, `cleanupPeriodDays`,
   `outputStyle`, `alwaysThinkingEnabled` and `spinnerTipsEnabled`. Everything else (hooks, `env`,
-  credential helpers, MCP servers, …) is dropped, and ai-safe's deny rules always win. If the merged text
+  credential helpers, MCP servers, …) is dropped, and ai-safe's deny rules always win. Non-string rules are
+  dropped, and so are team `allow` rules that are a bare tool name (such as `Bash`) or whose specifier
+  starts with `/` or `~` or contains `..`; `ask` and `deny` rules are kept. If the merged text
   still contains a known secret, only the generated settings are written. It is never integrated back.
 - Every other `.claude/` path, including `settings.local*.json`, stays excluded.
 

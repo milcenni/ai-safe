@@ -349,13 +349,25 @@ ALLOWED_SETTINGS_KEYS = (
 ALLOWED_PERMISSION_KEYS = ("allow", "ask", "deny")
 
 
+def _broad_allow(rule: str) -> bool:
+    """A team ``allow`` rule that is a bare tool name (allows every use of the tool) or
+    whose specifier reaches outside the workspace (starts with ``/`` or ``~``, or has ``..``)."""
+    if "(" not in rule:
+        return True
+    spec = rule[rule.index("(") + 1:].rstrip(")").strip()
+    return spec.startswith(("/", "~")) or ".." in spec
+
+
 def merge_claude_settings(team: dict | None, generated: dict) -> dict:
     """Merge the team's ``.claude/settings.json`` into ai-safe's generated settings.
 
     Only allowlisted keys survive (``ALLOWED_SETTINGS_KEYS`` and
     ``permissions.allow|ask|deny``). ai-safe's deny rules always win: the generated
     deny list is appended to the team's, and any ``allow``/``ask`` entry that the
-    generated deny list names is removed. Neither input is mutated.
+    generated deny list names is removed. Non-string entries are dropped, and so are
+    team ``allow`` entries that are a bare tool name or whose specifier starts with
+    ``/`` or ``~`` or contains ``..`` (``ask`` and ``deny`` are kept). Neither input
+    is mutated.
     """
     if not isinstance(team, dict):
         return copy.deepcopy(generated)
@@ -377,7 +389,10 @@ def merge_claude_settings(team: dict | None, generated: dict) -> dict:
             continue
         val = perms[key]
         if isinstance(val, list):
-            perms[key] = [e for e in val if e not in blocked]
+            keep = [e for e in val if isinstance(e, str) and e not in blocked]
+            if key == "allow":
+                keep = [e for e in keep if not _broad_allow(e)]
+            perms[key] = keep
         else:
             del perms[key]  # malformed: drop rather than guess (fail closed)
     merged["permissions"] = perms

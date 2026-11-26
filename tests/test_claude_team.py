@@ -407,3 +407,25 @@ def test_session_without_integrated_tree_hash_loads(team_project):
     data.pop("integrated_tree_hash", None)
     (state / "session.json").write_text(json.dumps(data))
     assert Session.load(state).integrated_tree_hash is None
+
+
+def test_merge_settings_drops_non_string_allow_and_ask_entries():
+    gen = claude_settings(Path("/tmp/state"))
+    team = {"permissions": {"allow": [{"x": 1}, ["y"], 3, None, "Bash(npm test)"],
+                            "ask": [{"x": 1}, "Bash(ls)"], "deny": [{"x": 1}, "Read(./a)"]}}
+    m = merge_claude_settings(team, gen)
+    assert m["permissions"]["allow"] == ["Bash(npm test)"]
+    assert m["permissions"]["ask"] == ["Bash(ls)"]
+    assert m["permissions"]["deny"][0] == "Read(./a)"
+
+
+def test_merge_settings_drops_broad_or_escaping_allow_entries():
+    gen = claude_settings(Path("/tmp/state"))
+    broad = ["Bash", "Read", "WebFetch", "Read(/etc/**)", "Edit(~/.bashrc)", "Read(../orig/**)",
+             "Read(./a/../../b)", "Bash(cat ..)"]
+    keep = ["Bash(npm test)", "Read(./src/**)", "Edit(src/**)", "WebFetch(domain:example.com)"]
+    team = {"permissions": {"allow": broad + keep, "ask": ["Bash", "Read(/etc/**)"], "deny": ["Read(../x)"]}}
+    m = merge_claude_settings(team, gen)
+    assert m["permissions"]["allow"] == keep
+    assert m["permissions"]["ask"] == ["Bash", "Read(/etc/**)"]  # ask is unchanged
+    assert m["permissions"]["deny"][0] == "Read(../x)"  # deny is unchanged

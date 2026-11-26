@@ -508,3 +508,14 @@ def test_original_changed_points_at_resync(project):
     assert res.aborted
     msgs = [i.message for i in res.review.issues if i.code == "original-changed"]
     assert msgs and all("ai-safe resync" in m for m in msgs)
+
+
+def test_cli_resync_refuses_inside_agent_before_touching_state(tmp_path, monkeypatch):
+    state = tmp_path / "fresh-state"
+    monkeypatch.setenv("AI_SAFE_STATE_DIR", str(state))
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.chdir(tmp_path)
+    r = CliRunner().invoke(app, ["resync"])
+    assert r.exit_code == 3, r.output
+    assert "developer" in r.output
+    assert not state.exists()

@@ -336,11 +336,11 @@ def resync(
     from ai_safe.resync import pending_changes
     from ai_safe.resync import resync as do_resync
 
+    if detect_ai_agent_env():  # before the session is resolved or the state directory is touched
+        raise SecurityError("resync must be run by the developer, not by an AI agent. Run `ai-safe resync` yourself in a normal terminal.")
     session, cfg, store, scanner = _session_context(session_id, config)
     c = console()
     c.print("[bold yellow]Close any AI session in the workspace before resyncing.[/bold yellow]")
-    if detect_ai_agent_env():
-        raise SecurityError("resync must be run by the developer, not by an AI agent. Run `ai-safe resync` yourself in a normal terminal.")
     pending = pending_changes(session)
     if discard and pending:
         answer = typer.prompt(f"Type 'discard' to throw away {len(pending)} uncommitted workspace change(s)",
