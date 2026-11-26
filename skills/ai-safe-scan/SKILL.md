@@ -17,6 +17,9 @@ contains secret values.
   or `git log -p` to view values.
 - If you are inside an ai-safe workspace, scan only the workspace (`ai-safe scan .`).
   Never scan paths outside it.
+- If you are an AI agent and the target is the developer's original repository, do not run
+  the scan yourself, even when asked: you would already have access to that repository. Give
+  the developer the command to run in a normal terminal instead.
 - Scanning is read-only: it never modifies files, the index or Git history.
 
 ## Expected inputs
@@ -25,8 +28,8 @@ contains secret values.
 - `gitleaks` on PATH, unless `scanner.engine: builtin` is configured.
 
 ## Procedure
-1. `ai-safe scan --report scan-report.json` (the report path must be outside any AI workspace
-   if you are scanning an original repository).
+1. `ai-safe scan --report scan-report.json` (when the developer scans an original repository,
+   the report path must be outside any AI workspace).
 2. Summarise: totals by category (API_KEY, ACCESS_TOKEN, PASSWORD, DATABASE_CREDENTIAL,
    PRIVATE_KEY, SSH_KEY, CLOUD_CREDENTIAL, JWT_SECRET, GENERIC_SECRET) and by location
    (tracked, untracked, ignored, staged, unstaged, history).

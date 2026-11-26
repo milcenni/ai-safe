@@ -218,7 +218,7 @@ dan tidak boleh membuka fail yang di-ignore untuk membuat keputusan.
    **Isolasi sebenar memerlukan salah satu daripada:**
    - menjalankan AI dalam **container** yang hanya mount folder workspace, atau
    - menjalankan AI sebagai **user OS yang berasingan**.
-3. **Jangan jalankan `ai-safe start`, `open` atau `resync` melalui AI** dalam repo asal, kerana AI itu sudah mempunyai akses ke
+3. **Jangan jalankan `ai-safe start`, `scan`, `sanitize`, `open` atau `resync` melalui AI** dalam repo asal, kerana AI itu sudah mempunyai akses ke
    repo asal. Developer patut menjalankannya sendiri di terminal.
 4. **Credential yang pernah di-commit ke Git dianggap sudah terdedah.** ai-safe akan memberi amaran,
    tetapi credential itu **mesti di-rotate** (ditukar). Membersihkan workspace tidak memadam sejarah

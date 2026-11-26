@@ -13,8 +13,8 @@ original `.git` is not copied, and the result is verified before use.
 ## Execution boundaries
 - This is a **developer-side** operation on the original repository. An AI agent that runs
   it can read the original repository, which defeats the purpose. If you are an AI agent,
-  give the developer the commands below and do not run them yourself, unless the developer
-  explicitly runs you outside the protected workflow for setup only.
+  never run `ai-safe start` or `ai-safe sanitize` yourself, even when asked. Give the developer
+  the commands below to run in a normal terminal.
 - Never print, copy or move original credential files. Never pass `--add-dir` with the
   original repository to the AI session that will use the workspace.
 - Never disable `security.fail_closed`, `workspace.verify_before_ai_access` or similar
@@ -29,7 +29,8 @@ original `.git` is not copied, and the result is verified before use.
 ## Procedure (developer)
 ```bash
 ai-safe start            # scan -> sanitize -> verify; prints the workspace path
-cd <workspace> && claude # or run the agent in a container that mounts only the workspace
+ai-safe open             # menu: AI agent CLI, VSCode, Docker, or print the commands
+# or yourself: cd <workspace> && claude (ideally in a container that mounts only the workspace)
 ```
 Lower-level equivalent: `ai-safe sanitize` then `ai-safe verify --session <id>`.
 

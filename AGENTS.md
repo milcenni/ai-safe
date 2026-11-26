@@ -83,9 +83,10 @@ nothing is installed system-wide.
 - **Never run `ai-safe integrate`, `ai-safe cleanup`, `ai-safe resync` or `ai-safe open`.** Integration
   requires the developer's typed approval, and integrate, resync and open refuse to run inside an AI agent
   session. Give the user the command instead.
-- **Don't run `ai-safe start`, `sanitize` or `scan` on a user's repository unless they explicitly ask.**
-  An agent that runs them in the original repository already has access to that repository, which
-  defeats the purpose. The output is redacted, but say this to the user.
+- **Never run `ai-safe start`, `ai-safe sanitize` or `ai-safe scan` in a user's repository, even when
+  asked.** An agent that runs them in the original repository already has access to that repository,
+  which defeats the purpose. Give the user the command to run in a normal terminal instead, and explain
+  why. Inside an ai-safe workspace, `ai-safe scan .`, `verify` and `review` are fine.
 - **Never read** `.env*` files, private keys, `~/.local/state/ai-safe/`, or credential stores (`~/.aws`,
   `~/.ssh`, `.npmrc`, `.netrc`, …).
 - **Never weaken ai-safe's configuration** (`fail_closed`, `require_approval`, exclusions, …) to make
