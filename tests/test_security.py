@@ -107,7 +107,10 @@ def test_secure_remove_tree_does_not_follow_symlinks(tmp_path):
     ({"scanner": {"custom_rules": [{"id": "x1", "regex": "("}]}}, "invalid regex"),
     ({"version": 2}, "version"),
     ({"scanner": {"scan_ignored": False}, "sanitization": {"include_ignored_files": True}}, "include_ignored_files"),
-    ({"security": {"docker_image": "bad image;rm"}}, "docker_image"),
+    ({"security": {"docker_image": "bad image;rm"}}, "invalid image reference"),
+    ({"security": {"docker_image": "--privileged"}}, "invalid image reference"),
+    ({"security": {"docker_image": "-v"}}, "invalid image reference"),
+    ({"security": {"docker_image": ""}}, "invalid image reference"),
 ])
 def test_config_validation_rejects_unsafe(snippet, msg):
     with pytest.raises(ConfigError) as exc:
