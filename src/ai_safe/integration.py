@@ -22,7 +22,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ai_safe.classifier import is_security_tool_file, match_exclude
+from ai_safe.classifier import is_security_tool_file, sensitive_match
 from ai_safe.config import AISafeConfig
 from ai_safe.credential_map import CredentialMap
 from ai_safe.models import Issue, Location, Severity
@@ -42,7 +42,7 @@ from ai_safe.security import (
     secure_remove_tree,
     write_private_file,
 )
-from ai_safe.workspace import Session
+from ai_safe.workspace import Session, tree_hash
 
 
 @dataclass
@@ -86,7 +86,7 @@ def _validate_targets(plan: list[PlannedChange], repo: Path, cfg: AISafeConfig) 
     for p in plan:
         if is_git_metadata_path(p.path):
             raise SecurityError(f"refusing to write Git metadata: {p.path}")
-        if match_exclude(p.path, excludes) or is_security_tool_file(p.path):
+        if sensitive_match(p.path, excludes) or is_security_tool_file(p.path):
             raise SecurityError(f"refusing to modify a sensitive file: {p.path}")
         target = safe_join(repo, p.path)  # traversal + symlinked components
         if target.is_symlink():
@@ -196,5 +196,7 @@ def integrate(
         atomic_write(target, p.content, p.mode or 0o644)
         result.applied.append(p.path)
     session.status = "integrated"
+    # Only a full integration means "workspace == what the developer accepted" (resync relies on it).
+    session.integrated_tree_hash = tree_hash(session.workspace_path) if not exclude_paths else None
     session.save()
     return result

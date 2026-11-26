@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from ai_safe import git_history as gh
-from ai_safe.classifier import is_security_tool_file, is_sensitive_config, match_exclude
+from ai_safe.classifier import ClaudePath, claude_path_policy, is_security_tool_file, is_sensitive_config, sensitive_match
 from ai_safe.config import AISafeConfig
 from ai_safe.credential_map import CredentialMap
 from ai_safe.models import Issue, Location, Severity, is_blocking
@@ -98,8 +98,13 @@ class ReviewReport:
         }
 
 
+_METADATA_POLICIES = (ClaudePath.AI_SAFE_SKILL, ClaudePath.SETTINGS, ClaudePath.OTHER)
+
+
 def _is_tool_metadata(path: str) -> bool:
-    return path in generated_paths() or path.startswith(".claude/")
+    """ai-safe / Claude Code files that are never integrated. The team's
+    ``.claude/skills|commands|agents/**`` (TEAM) are not metadata."""
+    return path in generated_paths() or claude_path_policy(path) in _METADATA_POLICIES
 
 
 def repo_salt(session: Session) -> bytes:
@@ -156,6 +161,10 @@ def review_session(session: Session, cfg: AISafeConfig, scanner: Scanner, *, exc
         if path == MARKER_FILE:
             report.add(Severity.ERROR, "marker-tampered", path, "workspace marker was modified or deleted")
             continue
+        policy = claude_path_policy(path)
+        if policy is ClaudePath.INSTALL:  # before --exclude and every skip: always blocking
+            report.add(Severity.ERROR, "ai-safe-install", path, "change inside an ai-safe installation directory is never allowed")
+            continue
         if any(path == e or path.startswith(e.rstrip("/") + "/") for e in exclude_paths):
             report.skipped.append(f"{path} (excluded by --exclude)")
             continue
@@ -178,7 +187,11 @@ def review_session(session: Session, cfg: AISafeConfig, scanner: Scanner, *, exc
         if is_security_tool_file(path):
             report.add(Severity.ERROR, "security-config", path, "change to security tooling configuration is not allowed")
             continue
-        pat = match_exclude(path, excludes)
+        if policy is ClaudePath.TEAM:
+            report.add(Severity.WARNING, "agent-instructions", path,
+                       "AI changed Claude Code skills/commands/agents - these steer future AI sessions in the "
+                       "original repository; read the full diff")
+        pat = sensitive_match(path, excludes)
         if pat:
             report.add(Severity.ERROR, "sensitive-file", path, f"AI attempted to {ch.kind.replace('_', ' ')} a sensitive/excluded file (matches {pat!r})")
             continue

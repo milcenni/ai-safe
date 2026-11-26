@@ -105,6 +105,7 @@ class Session:
     created_at: str
     status: str = "created"  # created | sanitized | verified | failed | integrated
     verified_tree_hash: str | None = None
+    integrated_tree_hash: str | None = None  # workspace tree after a full (no --exclude) integration
     history_only_secrets: int = 0
 
     @property
