@@ -241,6 +241,7 @@ def start(
     c.print("  Mapping   : stored outside the workspace (no values" + (", encrypted values kept" if cfg.security.store_secret_values else "") + ")")
     c.print()
     c.print("[bold]Launch Claude Code inside the sanitized workspace only:[/bold]")
+    c.print("  ai-safe open            (menu: AI agent CLI, VSCode, Docker, or print the commands)")
     c.print(f"  cd {session.workspace} && claude")
     c.print("Recommended isolation (skills and settings are guidance, not a security boundary):")
     c.print("  - run the agent as a separate OS user or in a container that mounts ONLY the workspace, e.g.")
@@ -252,9 +253,9 @@ def start(
         if not cfg.security.allow_ai_launch:
             c.print("[red]--launch refused: security.allow_ai_launch is false[/red]")
             raise typer.Exit(EXIT_USAGE)
-        env = {k: v for k, v in os.environ.items() if k in set(cfg.security.launch_env_allowlist)}
-        env["AI_SAFE_AGENT"] = "1"
-        subprocess.run(cfg.security.launch_command, cwd=session.workspace, env=env, check=False)
+        from ai_safe.launcher import launch_env
+
+        subprocess.run(cfg.security.launch_command, cwd=session.workspace, env=launch_env(cfg), check=False)
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +355,71 @@ def resync(
         raise typer.Exit(EXIT_FAIL)
     c.print("[bold green]Workspace resynced (same path)[/bold green]")
     c.print(f"  Workspace : {session.workspace}")
+
+
+@app.command("open")
+@guarded
+def open_cmd(
+    session_id: SessionOpt = None,
+    config: ConfigOpt = None,
+) -> None:
+    """Open the verified workspace in an AI agent CLI, VSCode or Docker (developer only, never automatic)."""
+    from ai_safe import launcher
+
+    if detect_ai_agent_env():
+        raise SecurityError("ai-safe open must be run by the developer, not by an AI agent")
+    store = SessionStore(state_root(load_config(config, None) if config else None))
+    session = store.resolve(session_id, Path.cwd())
+    cfg = load_config(config, session.repo_path if session.repo_path.is_dir() else None)
+    c = console()
+    ws = session.workspace_path
+    if not session.verified_tree_hash:
+        c.print("[red]Refused:[/red] the workspace has not passed verification. Run `ai-safe verify` or `ai-safe start`.")
+        raise typer.Exit(EXIT_FAIL)
+    if not ws.is_dir():
+        c.print("[red]Refused:[/red] the workspace no longer exists. Run `ai-safe start` again.")
+        raise typer.Exit(EXIT_FAIL)
+
+    c.print(f"Workspace: {ws}", markup=False)
+    c.print("Reminder: run `ai-safe verify` and `ai-safe review` on the host, not inside the AI session.")
+    options = launcher.launch_options(ws, cfg)
+    by_key = {o.key: o for o in options}
+
+    def print_examples() -> None:
+        c.print("Commands:")
+        c.print(by_key["print"].example, markup=False)
+
+    if not cfg.security.allow_ai_launch:
+        print_examples()
+        c.print("ai-safe does not launch anything until you set security.allow_ai_launch: true in ai-safe.yaml.")
+        raise typer.Exit(EXIT_OK)
+    if not launcher.is_interactive():
+        print_examples()
+        c.print("[yellow]No interactive terminal:[/yellow] printed the commands only.")
+        raise typer.Exit(EXIT_USAGE)
+
+    for i, o in enumerate(options, 1):
+        c.print(f"  {i}) {o.label}", markup=False)
+    valid = [str(i) for i in range(1, len(options) + 1)]
+    choice = typer.prompt(f"Choose [{'/'.join(valid)}]", default="", show_default=False).strip()
+    if choice not in valid:
+        c.print("[yellow]No valid choice:[/yellow] nothing was launched.")
+        raise typer.Exit(EXIT_USAGE)
+    opt = options[int(choice) - 1]
+    if opt.key == "print":
+        print_examples()
+        raise typer.Exit(EXIT_OK)
+    if opt.key == "docker" and opt.argv is None:
+        c.print(opt.example, markup=False)
+        c.print("Docker was not run: set security.docker_image (and make sure `docker` is on PATH).")
+        raise typer.Exit(EXIT_USAGE)
+    rc = launcher.run_option(opt, ws, launcher.launch_env(cfg))
+    if rc != 0:
+        c.print(f"[yellow]{opt.label} exited with code {rc}.[/yellow] Run it yourself:", highlight=False)
+        c.print(opt.example, markup=False)
+        if opt.key == "docker":
+            c.print("Hint: set security.docker_image to an image that contains Claude Code.")
+        raise typer.Exit(EXIT_ERROR)
 
 
 # ---------------------------------------------------------------------------
