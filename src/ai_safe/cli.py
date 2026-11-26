@@ -152,6 +152,10 @@ def _verify(session: Session, cfg: AISafeConfig, scanner: Scanner, c) -> bool:
     vr = verify_workspace(session.workspace_path, cfg, scanner, original_repo=session.repo_path, fingerprints=cmap.fingerprints())
     write_json(session.reports_dir / "verify.json", vr.public())
     render_issues("Verification", vr.issues, c, vr.passed)
+    if session.status == "resyncing":
+        # verify cannot vouch for a half-swapped workspace/state: only a completed resync can
+        c.print("[red]An ai-safe resync of this workspace did not finish.[/red] Run `ai-safe resync` (or `ai-safe resync --discard`).")
+        return False
     if vr.passed:
         session.status = "verified"
         session.verified_tree_hash = vr.tree_hash
@@ -373,7 +377,10 @@ def open_cmd(
     cfg = load_config(config, session.repo_path if session.repo_path.is_dir() else None)
     c = console()
     ws = session.workspace_path
-    if not session.verified_tree_hash:
+    if session.status == "resyncing":
+        c.print("[red]Refused:[/red] an ai-safe resync of this workspace did not finish. Run `ai-safe resync` first.")
+        raise typer.Exit(EXIT_FAIL)
+    if session.status == "failed" or not session.verified_tree_hash:
         c.print("[red]Refused:[/red] the workspace has not passed verification. Run `ai-safe verify` or `ai-safe start`.")
         raise typer.Exit(EXIT_FAIL)
     if not ws.is_dir():

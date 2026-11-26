@@ -313,3 +313,158 @@ def test_resync_aborts_if_ai_edits_during_staging(project, monkeypatch):
     assert not res.ok and "resync --discard" in res.reason
     assert (project.ws / "app/late.py").read_text() == "LATE = 1\n"
     assert leftovers(project) == ([], [])
+
+
+# ---------------------------------------------------------------------------
+# failure during the swap: never leave a "verified" session over a mixed workspace
+# ---------------------------------------------------------------------------
+
+
+def test_replace_tree_contents_keyboard_interrupt_rolls_back(tmp_path, monkeypatch):
+    dst, src = tmp_path / "dst", tmp_path / "src"
+    dst.mkdir()
+    src.mkdir()
+    for n in ("a.txt", "b.txt"):
+        (dst / n).write_text("old " + n)
+    for n in ("c.txt", "d.txt", "e.txt"):
+        (src / n).write_text("new " + n)
+    real_rename = os.rename
+    calls = {"n": 0}
+
+    def interrupted(a, b):
+        if str(a).startswith(str(src) + os.sep):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise KeyboardInterrupt
+        return real_rename(a, b)
+
+    monkeypatch.setattr(os, "rename", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        replace_tree_contents(dst, src)
+    monkeypatch.setattr(os, "rename", real_rename)
+    assert sorted(p.name for p in dst.iterdir()) == ["a.txt", "b.txt"]
+    assert sorted(p.name for p in src.iterdir()) == ["c.txt", "d.txt", "e.txt"]
+    assert [p.name for p in tmp_path.iterdir() if p.name not in ("dst", "src")] == []
+
+
+def _open_cli(p):
+    return CliRunner().invoke(app, ["open", "-s", p.session.id])
+
+
+def test_resync_crash_mid_swap_leaves_session_resyncing(project, monkeypatch):
+    (project.repo / "app/util.py").write_text("def add(a, b):\n    return 9\n")
+    before = Session.load(project.session.state_path)
+    seen = {}
+
+    def dies(dst, src):
+        # what is on disk at this point is what a SIGKILL would leave behind
+        seen["session"] = Session.load(project.session.state_path)
+        raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr(resync_mod, "replace_tree_contents", dies)
+    with pytest.raises(RuntimeError):
+        run(project)
+    crashed = seen["session"]
+    assert crashed.status == "resyncing" and crashed.verified_tree_hash is None
+    # complete rollback: the old status and hash are restored
+    after = Session.load(project.session.state_path)
+    assert (after.status, after.verified_tree_hash) == (before.status, before.verified_tree_hash)
+    assert leftovers(project) == ([], [])
+
+    # now pretend the process had died: the on-disk session is the in-flight one
+    crashed.save()
+    monkeypatch.chdir(project.repo)
+    r = _open_cli(project)
+    assert r.exit_code == 1, r.output
+    crashed.verified_tree_hash = before.verified_tree_hash  # even with a hash, "resyncing" refuses
+    crashed.save()
+    assert _open_cli(project).exit_code == 1
+    edit_ws(project)
+    with pytest.raises(SecurityError, match="resync"):
+        integrate(crashed, project.cfg, project.scanner, confirm=APPROVE, cwd=project.repo)
+
+
+def test_open_refuses_failed_session(project, monkeypatch):
+    project.session.status = "failed"
+    project.session.save()
+    monkeypatch.chdir(project.repo)
+    assert _open_cli(project).exit_code == 1
+
+
+def test_resync_incomplete_workspace_rollback_stays_resyncing(project, monkeypatch):
+    from ai_safe.workspace import IncompleteRollbackError
+
+    def half(dst, src):
+        raise IncompleteRollbackError("synthetic: old contents kept in /x")
+
+    monkeypatch.setattr(resync_mod, "replace_tree_contents", half)
+    manifest = project.session.manifest_path.read_bytes()
+    with pytest.raises(SecurityError):
+        run(project)
+    after = Session.load(project.session.state_path)
+    assert after.status == "resyncing" and after.verified_tree_hash is None
+    assert project.session.manifest_path.read_bytes() == manifest  # old state is back
+
+
+def test_resync_state_undo_failure_keeps_old_state(project, monkeypatch):
+    (project.repo / "app/util.py").write_text("def add(a, b):\n    return 5\n")
+    manifest = project.session.manifest_path.read_bytes()
+    real_rename = os.rename
+
+    def ws_fails(dst, src):
+        # workspace swap fails and the state undo fails too (double fault)
+        def no_restore(a, b):
+            if f"{os.sep}.old{os.sep}" in str(a):
+                raise OSError(errno.EIO, "synthetic I/O error")
+            return real_rename(a, b)
+        monkeypatch.setattr(os, "rename", no_restore)
+        raise SecurityError("workspace replacement failed (synthetic); workspace left untouched")
+
+    monkeypatch.setattr(resync_mod, "replace_tree_contents", ws_fails)
+    with pytest.raises(SecurityError, match=r"\.resync") as exc:
+        run(project)
+    monkeypatch.setattr(os, "rename", real_rename)
+    old = project.store.sessions_dir / f"{project.session.id}.resync" / ".old"
+    assert str(old) in str(exc.value)
+    assert (old / "manifest.json").read_bytes() == manifest
+    assert (old / "snapshot").is_dir()
+    after = Session.load(project.session.state_path)
+    assert after.status == "resyncing" and after.verified_tree_hash is None
+    # a later resync never shreds the kept state
+    with pytest.raises(SecurityError, match=r"\.old"):
+        run(project, discard=True)
+    assert (old / "manifest.json").read_bytes() == manifest
+
+
+def test_swap_state_undo_failure_keeps_old_state(tmp_path, monkeypatch):
+    live, stage = tmp_path / "live", tmp_path / "stage"
+    live.mkdir()
+    stage.mkdir()
+    for n in resync_mod.STATE_ITEMS:
+        (live / n).write_text("old")
+        (stage / n).write_text("new")
+    real_rename = os.rename
+    n_calls = {"n": 0}
+
+    def flaky(a, b):
+        n_calls["n"] += 1
+        if n_calls["n"] == 4 or f"{os.sep}.old{os.sep}" in str(a):
+            raise OSError(errno.EIO, "synthetic I/O error")
+        return real_rename(a, b)
+
+    monkeypatch.setattr(os, "rename", flaky)
+    with pytest.raises(SecurityError, match=r"\.old"):
+        resync_mod._swap_state(live, stage)
+    monkeypatch.setattr(os, "rename", real_rename)
+    assert (stage / ".old" / "manifest.json").read_text() == "old"
+
+
+def test_cli_verify_does_not_clear_resyncing(project, monkeypatch):
+    cfg = builtin_cfg_file(project)
+    project.session.status, project.session.verified_tree_hash = "resyncing", None
+    project.session.save()
+    monkeypatch.chdir(project.repo)
+    r = CliRunner().invoke(app, ["verify", "-s", project.session.id, "-c", str(cfg)])
+    after = Session.load(project.session.state_path)
+    assert after.status == "resyncing" and after.verified_tree_hash is None, r.output
+    assert r.exit_code == 1 and "ai-safe resync" in r.output

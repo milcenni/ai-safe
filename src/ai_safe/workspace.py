@@ -103,7 +103,7 @@ class Session:
     workspace: str
     state_dir: str
     created_at: str
-    status: str = "created"  # created | sanitized | verified | failed | integrated
+    status: str = "created"  # created | sanitized | verified | failed | integrated | resyncing
     verified_tree_hash: str | None = None
     integrated_tree_hash: str | None = None  # reviewed workspace tree after a full (no --exclude) integration; None if it changed during approval
     history_only_secrets: int = 0
@@ -439,6 +439,10 @@ def tree_hash(root: Path) -> str:
 REPLACE_BACKUP_PREFIX = "ai-safe-old-"
 
 
+class IncompleteRollbackError(SecurityError):
+    """A failed in-place replacement could not be fully undone: ``dst`` is mixed."""
+
+
 def replace_tree_contents(dst: Path, src: Path) -> None:
     """Replace every entry inside ``dst`` with the entries of ``src``.
 
@@ -446,8 +450,11 @@ def replace_tree_contents(dst: Path, src: Path) -> None:
     same (an open AI session keeps its working directory). Entries are moved with
     ``os.rename`` only, never copied, and symlinks are never followed. The old
     entries are first moved into a private sibling backup directory; if any move
-    fails (for example ``EXDEV``), everything is moved back and ``SecurityError``
-    is raised, so ``dst`` is left as it was. On success the backup is removed.
+    fails or is interrupted (``EXDEV``, ``KeyboardInterrupt``, any exception),
+    everything is moved back and the error is raised (``SecurityError`` for an
+    ``OSError``), so ``dst`` is left as it was. If the rollback itself fails,
+    the backup is kept and :class:`IncompleteRollbackError` names it. On success
+    the backup is removed.
     """
     dst, src = Path(dst), Path(src)
     for d in (dst, src):
@@ -467,22 +474,26 @@ def replace_tree_contents(dst: Path, src: Path) -> None:
             for name in sorted(os.listdir(src)):
                 os.rename(src / name, dst / name)
                 moved_in.append(name)
-        except OSError:
+        except BaseException as exc:
             rolled_back = True
             for name in reversed(moved_in):
                 try:
                     os.rename(dst / name, src / name)
-                except OSError:
+                except BaseException:
                     rolled_back = False
             for name in reversed(moved_out):
                 try:
                     os.rename(backup / name, dst / name)
-                except OSError:
+                except BaseException:
                     rolled_back = False
             if not rolled_back:
                 keep_backup = True
-                raise SecurityError(f"workspace replacement failed and could not be fully rolled back; old contents kept in {backup}") from None
-            raise SecurityError("workspace replacement failed (cross-filesystem or I/O error); workspace left untouched") from None
+                raise IncompleteRollbackError(
+                    f"workspace replacement failed and could not be fully rolled back; old contents kept in {backup}"
+                ) from None
+            if isinstance(exc, OSError):
+                raise SecurityError("workspace replacement failed (cross-filesystem or I/O error); workspace left untouched") from None
+            raise
     finally:
         if not keep_backup:
             secure_remove_tree(backup)

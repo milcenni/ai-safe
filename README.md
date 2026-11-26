@@ -261,13 +261,17 @@ default) it prints the commands and exits. Otherwise it shows a menu: (1) the AI
 (`security.launch_command`), (2) VSCode (`code -n <workspace>`), (3) Docker (`security.docker_image`, which
 mounts only the workspace; without an image or without `docker` on PATH it prints an example command),
 (4) print the commands only. The launched process gets only the `security.launch_env_allowlist` variables
-plus `AI_SAFE_AGENT=1`. It refuses inside an AI agent session and on a workspace that has not passed
-verification.
+plus `AI_SAFE_AGENT=1`. It refuses inside an AI agent session, on a workspace that has not passed
+verification (or whose last verification failed), and while a resync is unfinished.
 
 **`ai-safe resync`** builds and verifies a fresh workspace in a staging directory next to the current one,
 then swaps the session state and the workspace contents in place. The workspace keeps its path, so an
-editor window stays valid, but close any AI session in it first. Any failure leaves the old workspace and
-the session state untouched. It runs without `--discard` only when the workspace has no changes since the
+editor window stays valid, but close any AI session in it first. A failure before the swap (scan,
+sanitization, verification) leaves the old workspace and the session state untouched. A failure or
+interrupt during the swap rolls both back; while the swap runs the session is marked `resyncing` with no
+verified hash, so if the process dies or a rollback cannot complete, `open`, `integrate` and `verify`
+refuse the session until you run `ai-safe resync` again. If a rollback cannot complete, the old contents
+are kept (never deleted) and the error names the directory. It runs without `--discard` only when the workspace has no changes since the
 snapshot, or is exactly what you last integrated in full. Otherwise integrate first, or pass `--discard`
 and type `discard` to throw the changes away. It refuses inside an AI agent session.
 

@@ -30,7 +30,14 @@ from ai_safe.security import (
     secure_remove_tree,
 )
 from ai_safe.verifier import VerificationReport, verify_workspace
-from ai_safe.workspace import Session, SessionStore, replace_tree_contents, tree_hash, write_marker
+from ai_safe.workspace import (
+    IncompleteRollbackError,
+    Session,
+    SessionStore,
+    replace_tree_contents,
+    tree_hash,
+    write_marker,
+)
 
 PENDING_REASON = "workspace has changes not integrated - run ai-safe integrate, or resync --discard"
 STATE_ITEMS = ("manifest.json", "credential-map.json", "credential-secrets.enc", "snapshot")
@@ -70,6 +77,10 @@ def _check_workspace(session: Session, store: SessionStore) -> Path:
     return ws
 
 
+class _StateKept(SecurityError):
+    """Undoing the state swap failed; the old state is kept in ``stage/.old``."""
+
+
 def _swap_state(live: Path, stage: Path) -> list[tuple[Path, Path]]:
     """Move the new state items from ``stage`` into ``live``; the old ones go to
     ``stage/.old``. Returns the performed renames so they can be undone."""
@@ -83,15 +94,25 @@ def _swap_state(live: Path, stage: Path) -> list[tuple[Path, Path]]:
             if os.path.lexists(stage / name):
                 os.rename(stage / name, live / name)
                 done.append((stage / name, live / name))
-    except OSError:
-        _undo(done)
-        raise SecurityError("could not replace the session state; nothing was changed") from None
+    except BaseException as exc:
+        _undo(done, old)
+        if isinstance(exc, OSError):
+            raise SecurityError("could not replace the session state; nothing was changed") from None
+        raise
     return done
 
 
-def _undo(done: list[tuple[Path, Path]]) -> None:
-    for src, dst in reversed(done):
-        os.rename(dst, src)
+def _undo(done: list[tuple[Path, Path]], old: Path) -> None:
+    """Reverse the renames in ``done``. If that fails, the old state stays in
+    ``old`` (never shredded) and ``_StateKept`` names it."""
+    try:
+        for src, dst in reversed(done):
+            os.rename(dst, src)
+    except BaseException:
+        raise _StateKept(
+            f"resync failed and the old session state could not be restored; it is kept in {old}. "
+            "The session is marked 'resyncing': open and integrate refuse it until it is repaired."
+        ) from None
 
 
 def resync(
@@ -111,15 +132,21 @@ def resync(
             "Run `ai-safe resync` yourself in a normal terminal."
         )
     ws = _check_workspace(session, store)
+    stage_state = store.sessions_dir / f"{session.id}.resync"
+    if os.path.lexists(stage_state / ".old"):
+        raise SecurityError(
+            f"an earlier resync kept the old session state in {stage_state / '.old'}; "
+            "inspect it, then remove that directory before resyncing again"
+        )
     if pending_changes(session) and not discard:
         return ResyncResult(False, PENDING_REASON, None)
 
     scan = scanner.scan(session.repo_path)
 
-    stage_state = store.sessions_dir / f"{session.id}.resync"
     if os.path.lexists(stage_state):  # leftover of an interrupted resync
         secure_remove_tree(stage_state, shred=True)
     stage_ws: Path | None = None
+    keep_state = False
     try:
         ensure_private_dir(stage_state)
         stage_ws = secure_mkdtemp(WORKSPACE_PREFIX, ws.parent)  # same filesystem as ws: rename only
@@ -135,11 +162,33 @@ def resync(
         # The AI may have kept working while we staged: re-check right before the swap.
         if not discard and pending_changes(session):
             return ResyncResult(False, PENDING_REASON, None)
-        done = _swap_state(session.state_path, stage_state)
+
+        # Fail closed across crashes: while state and workspace are being swapped the
+        # session is "resyncing" with no verified hash, so open/integrate refuse it.
+        # The old values come back only after a complete rollback.
+        prev = (session.status, session.verified_tree_hash)
+        session.status, session.verified_tree_hash = "resyncing", None
+        session.save()
+        try:
+            done = _swap_state(session.state_path, stage_state)
+        except _StateKept:
+            keep_state = True
+            raise
+        except BaseException:
+            session.status, session.verified_tree_hash = prev
+            session.save()
+            raise
         try:
             replace_tree_contents(ws, stage_ws)
-        except BaseException:
-            _undo(done)
+        except BaseException as exc:
+            try:
+                _undo(done, stage_state / ".old")
+            except _StateKept:
+                keep_state = True
+                raise
+            if not isinstance(exc, IncompleteRollbackError):
+                session.status, session.verified_tree_hash = prev
+                session.save()
             raise
         session.status = "verified"
         session.verified_tree_hash = tree_hash(ws)
@@ -150,4 +199,5 @@ def resync(
     finally:
         if stage_ws is not None:
             secure_remove_tree(stage_ws)
-        secure_remove_tree(stage_state, shred=True)
+        if not keep_state:
+            secure_remove_tree(stage_state, shred=True)

@@ -65,6 +65,8 @@ def guard_human_context(session: Session, cwd: Path) -> None:
         )
     if is_within(cwd, session.workspace_path):
         raise SecurityError("integration cannot be run from inside the AI workspace")
+    if session.status == "resyncing":
+        raise SecurityError("an ai-safe resync of this workspace did not finish; run `ai-safe resync` first (fail closed)")
     if not session.verified_tree_hash:
         raise SecurityError("this workspace never passed `ai-safe verify`; integration refused (fail closed)")
 
