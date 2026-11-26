@@ -68,9 +68,12 @@ def test_env_files_keys_and_credential_stores_excluded(make_repo, fake):
     })
     write(repo, {".env": f"DB_PASSWORD={fake.password()}\n"})
     p = prepare(repo)
-    for rel in ("deploy/id_rsa", "certs/server.pem", "credentials.json", "secrets/prod.txt", ".npmrc", ".env.production", ".ai-safe/bin/ai-safe"):
+    for rel in ("deploy/id_rsa", "certs/server.pem", "credentials.json", "secrets/prod.txt", ".npmrc", ".env.production"):
         assert not (p.ws / rel).exists(), rel
         assert entry(p, rel).action == "excluded"
+    # ai-safe's install dir is dropped by the scanner before sanitization: never copied, no manifest entry.
+    assert not (p.ws / ".ai-safe").exists()
+    assert not any(e.path.startswith(".ai-safe/") for e in p.result.entries)
     assert not (p.ws / ".env").exists()
     assert not (p.ws / ".claude" / "settings.local.json").exists()
     assert (p.ws / "app.py").exists()

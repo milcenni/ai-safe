@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ai_safe import git_history as gh
-from ai_safe.classifier import categorize
+from ai_safe.classifier import ClaudePath, categorize, claude_path_policy, is_pristine_ai_safe_skill
 from ai_safe.config import AISafeConfig
 from ai_safe.detectors import BuiltinDetector, key_before
 from ai_safe.gitleaks import Gitleaks, load_report
@@ -169,7 +169,19 @@ class Scanner:
             return text
         return data.decode("utf-8")
 
+    @staticmethod
+    def _skip(root: Path, rel: str) -> bool:
+        """ai-safe's own install dirs and unmodified ai-safe skills are not scanned.
+
+        A modified ai-safe skill is scanned like any other file.
+        """
+        return claude_path_policy(rel) == ClaudePath.INSTALL or is_pristine_ai_safe_skill(root, rel)
+
     def list_files(self, root: Path, is_git: bool, result: ScanResult) -> dict[str, Location]:
+        files = self._list_files(root, is_git, result)
+        return {rel: loc for rel, loc in files.items() if not self._skip(root, rel)}
+
+    def _list_files(self, root: Path, is_git: bool, result: ScanResult) -> dict[str, Location]:
         files: dict[str, Location] = {}
         if is_git:
             for f in gh.list_tracked(root):
@@ -240,6 +252,8 @@ class Scanner:
         if self.gitleaks:
             for rec in self.gitleaks.scan_dir(root):
                 rel = rec["File"]
+                if self._skip(root, rel):
+                    continue
                 loc = files.get(rel)
                 if loc is None:
                     if not self.cfg.scanner.scan_ignored and is_git:

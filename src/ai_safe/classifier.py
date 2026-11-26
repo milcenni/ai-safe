@@ -3,6 +3,8 @@
 * ``categorize`` maps a detector rule / key name / value to a :class:`Category`.
 * ``match_exclude`` decides whether a path is a sensitive file that must never
   be copied into the AI workspace.
+* ``claude_path_policy`` / ``sensitive_match`` implement the ``.claude/`` policy
+  (ai-safe install and skills vs. the team's shared agent instructions).
 * ``file_kind`` drives format-aware detection (config vs. source files).
 * ``is_sensitive_key`` decides whether an assignment key names a credential.
 """
@@ -10,8 +12,11 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
-from pathlib import PurePosixPath
+import stat
+from enum import Enum
+from pathlib import Path, PurePosixPath
 
 from ai_safe.models import Category
 
@@ -48,6 +53,78 @@ def match_exclude(rel: str, patterns: list[str]) -> str | None:
             if any(fnmatch.fnmatchcase(p, pat) for p in parts):
                 return pattern
     return None
+
+
+class ClaudePath(Enum):
+    """How a path relates to ai-safe's install and the ``.claude/`` directory."""
+
+    NONE = "none"                    # not under .ai-safe/ or .claude/
+    INSTALL = "install"              # .ai-safe/** or .claude/ai-safe/**: never scanned, never copied
+    AI_SAFE_SKILL = "ai_safe_skill"  # .claude/skills/<ai-safe skill>/**: regenerated from templates
+    TEAM = "team"                    # .claude/skills|commands|agents/**: scanned, redacted, copied
+    SETTINGS = "settings"            # .claude/settings.json: merged into the generated settings
+    OTHER = "other"                  # any other .claude/ path: stays excluded
+
+
+_TEAM_DIRS = ("skills", "commands", "agents")
+
+
+def claude_path_policy(rel: str) -> ClaudePath:
+    """Classify ``rel`` (repository-relative, POSIX) under the ``.claude/`` policy.
+
+    Matching is case-insensitive, like :func:`match_exclude`.
+    """
+    from ai_safe.workspace import SKILL_NAMES  # lazy: avoids an import cycle
+
+    parts = [p.casefold() for p in PurePosixPath(rel).parts]
+    if len(parts) >= 2 and parts[0] == ".ai-safe":
+        return ClaudePath.INSTALL
+    if len(parts) < 2 or parts[0] != ".claude":
+        return ClaudePath.NONE
+    if len(parts) >= 3 and parts[1] == "ai-safe":
+        return ClaudePath.INSTALL
+    if len(parts) >= 4 and parts[1] == "skills" and parts[2] in {n.casefold() for n in SKILL_NAMES}:
+        return ClaudePath.AI_SAFE_SKILL
+    if len(parts) >= 3 and parts[1] in _TEAM_DIRS:
+        return ClaudePath.TEAM
+    if len(parts) == 2 and parts[1] == "settings.json":
+        return ClaudePath.SETTINGS
+    return ClaudePath.OTHER
+
+
+def sensitive_match(rel: str, excludes: list[str]) -> str | None:
+    """Like :func:`match_exclude`, but the ``.claude/`` pattern does not apply to
+    TEAM and SETTINGS paths. Every other pattern (``.env``, ``*.pem``, …) still does.
+    """
+    if claude_path_policy(rel) in (ClaudePath.TEAM, ClaudePath.SETTINGS):
+        excludes = [p for p in excludes if p.casefold() != ".claude/"]
+    return match_exclude(rel, excludes)
+
+
+def is_pristine_ai_safe_skill(root: Path, rel: str) -> bool:
+    """True only when ``rel`` is an ai-safe skill's ``SKILL.md`` whose bytes equal
+    the current template. Any other file in an ai-safe skill directory, a
+    modified or missing ``SKILL.md``, or a non-regular file is not pristine.
+    """
+    from ai_safe.workspace import SKILL_NAMES, skill_template  # lazy: avoids an import cycle
+
+    if claude_path_policy(rel) != ClaudePath.AI_SAFE_SKILL:
+        return False
+    parts = PurePosixPath(rel).parts
+    if len(parts) != 4 or parts[3] != "SKILL.md":
+        return False
+    name = next((n for n in SKILL_NAMES if n.casefold() == parts[2].casefold()), None)
+    if name is None or parts[2] != name:
+        return False
+    path = Path(root) / rel
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        data = path.read_bytes()
+    except OSError:
+        return False
+    return data == skill_template(name).encode("utf-8")
 
 
 CONFIG_EXTENSIONS = {
