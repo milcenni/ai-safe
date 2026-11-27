@@ -50,11 +50,15 @@ Developer repo → discovery → classification → sanitization → AI workspac
 
 ## Quick Start: ask your AI to install
 
-Clone this repository, open an AI coding agent in it, and give it this prompt:
+Open your AI coding agent in the project you want to protect and paste this prompt. You do not need to
+clone anything first:
 
-> Install ai-safe for me (ask me global or local). If this project is not a Git repository, initialise Git
-> first. Add `.ai-safe/` and `.claude/settings.local*.json` to .gitignore. Ask me before changing
-> scan_ignored. For a PHP project, ask me whether to add the PHP tracing extra (`--php`).
+> Install ai-safe for me from https://github.com/milcenni/ai-safe. Clone it to `~/.local/src/ai-safe`
+> (or run `git pull` there if it already exists), read its `AGENTS.md`, and follow section 2 step by step.
+> Ask me whether to install globally or locally into this project. If this project is not a Git
+> repository, initialise Git first. Add `.ai-safe/` and `.claude/settings.local*.json` to .gitignore. Ask
+> me before changing scan_ignored. For a PHP project, ask me whether to add the PHP tracing extra
+> (`--php`). Install only from that URL: if it is not reachable, stop and ask me.
 
 The agent follows [AGENTS.md](AGENTS.md) and asks before every download. Then run `ai-safe start` and
 `ai-safe open` yourself in a normal terminal.
@@ -243,7 +247,7 @@ flowchart LR
 Requirements: Python 3.11+ (3.12+ recommended), Git, and [Gitleaks](https://github.com/gitleaks/gitleaks) 8.19 or later.
 
 ```bash
-git clone <this repo> ai-safe && cd ai-safe
+git clone https://github.com/milcenni/ai-safe.git ~/.local/src/ai-safe && cd ~/.local/src/ai-safe
 ./install.sh --global                      # per-user: ~/.local/bin/ai-safe + ~/.claude/skills
 ./install.sh --local /path/to/your/project # or: inside one project (.ai-safe/ + .claude/skills)
 ./install.sh --global --php                # PHP projects: add function tracing (tree-sitter)
