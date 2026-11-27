@@ -26,6 +26,7 @@ from ai_safe.config import AISafeConfig
 from ai_safe.detectors import BuiltinDetector, key_before
 from ai_safe.gitleaks import Gitleaks, load_report
 from ai_safe.models import Category, Finding, Location
+from ai_safe.php_dataflow import trace_php
 from ai_safe.security import REDACTOR, hmac_fingerprint, is_binary, is_placeholder_value
 
 
@@ -249,6 +250,16 @@ class Scanner:
             texts[rel] = text
             result.files_scanned += 1
             findings.extend(self.detect_text(text, rel, loc))
+
+        # 1b. PHP dataflow: credential-call arguments traced across the working tree
+        if self.cfg.scanner.php_dataflow != "off":
+            flow, flow_warnings = trace_php(texts)
+            for ff in flow:
+                findings.append(self._finding(
+                    rule_id=ff.rule_id, category=ff.category, file=ff.file, line=ff.line, end_line=ff.line,
+                    engine="builtin", location=files[ff.file], key=ff.key, secret=ff.secret,
+                ))
+            result.warnings.extend(str(w) for w in flow_warnings)
 
         if self.gitleaks:
             for rec in self.gitleaks.scan_dir(root):

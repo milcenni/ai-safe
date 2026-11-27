@@ -37,7 +37,7 @@ PATTERNS: list[Pattern] = [
     }, 6, "B"),
     Pattern("global-in-function", {
         "db.php": "<?php\n$p = '{PW}';\nfunction db() {{\n    global $p;\n    return mysqli_connect('db', 'app', $p);\n}}\n",
-    }, 5, "B"),
+    }, 5, "B1"),
     Pattern("odd-constant-name", {"db.php": "<?php\ndefine('X1', '{PW}');\n$c = mysqli_connect('db', 'app', X1);\n"}, 3, "B1"),
     Pattern("class-property", {
         "Db.php": "<?php\nclass Db {{\n    var $k = '{PW}';\n    function c() {{ return new mysqli('db', 'app', $this->k); }}\n}}\n",

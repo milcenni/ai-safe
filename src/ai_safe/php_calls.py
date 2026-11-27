@@ -18,6 +18,7 @@ become placeholders.
 
 from __future__ import annotations
 
+import bisect
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -129,9 +130,13 @@ _GENERIC = Sink(None, 0, "connect")  # placeholder keys for connect-like wrapper
 
 @dataclass(frozen=True)
 class Arg:
-    kind: str  # "str" (plain string literal), "num", "array", "other", "empty"
-    value: str = ""
-    start: int = 0  # str: span of the content inside the quotes; array: the '['
+    # "str" (plain string literal), "num", "array", "var" ($name), "const"
+    # (NAME, self::NAME, Class::NAME), "prop" ($this->x, self::$x),
+    # "source" (a non-credential source: superglobals, getenv, env, config),
+    # "other" (any other expression), "empty"
+    kind: str
+    value: str = ""  # str: content; var/prop/const: the name (no "$")
+    start: int = 0  # str: span of the content inside the quotes; array: the '['; other: the argument
     end: int = 0
 
 
@@ -144,6 +149,19 @@ class CallMatch:
     secret: str
     category: Category
     key: str
+
+
+@dataclass(frozen=True)
+class SinkSlot:
+    """One user or password argument of one credential call."""
+
+    role: str  # "user" or "password"
+    arg: Arg
+    sink: Sink
+    file: str
+    line: int
+    call: int  # offset of the call: slots of one call share it
+    generic: bool  # connect-like wrapper (host-like values are not credentials)
 
 
 def is_php(path: str) -> bool:
@@ -188,31 +206,66 @@ def parse_args(text: str, open_idx: int) -> list[Arg] | None:
     return None
 
 
+_SUPERGLOBALS = {"_GET", "_POST", "_REQUEST", "_COOKIE", "_SERVER", "_ENV", "_FILES", "_SESSION", "GLOBALS"}
+_SOURCE_CALL = re.compile(r"(?i)^\\?(?:getenv|env|config|ini_get|filter_input|apache_getenv)\s*\(")
+_VAR = re.compile(r"^\$([A-Za-z_]\w*)$")
+_PROP = re.compile(r"^(?:\$this\s*->\s*|(?:self|static)::\$)([A-Za-z_]\w*)$")
+_CONST = re.compile(r"^(?:(?:self|static|\\?[A-Za-z_][\w\\]*)::)?\\?([A-Za-z_]\w*)$")
+_NOT_CONST = {"true", "false", "null"}
+
+
 def _classify(text: str, start: int, end: int, literals: list[tuple[str, int, int]]) -> Arg:
-    seg = text[start:end].strip()
+    raw = text[start:end]
+    seg = raw.strip()
     if not seg:
         return Arg("empty")
+    seg_start = start + (len(raw) - len(raw.lstrip()))
     if len(literals) == 1:
         q, s, e = literals[0]
         if seg == text[s - 1:e + 1]:
             value = text[s:e]
             if q == '"' and "$" in value:
-                return Arg("other")  # interpolated
+                return Arg("other", "", seg_start, seg_start + len(seg))  # interpolated
             return Arg("str", value, s, e)
     if _NUM_RE.match(seg):
         return Arg("num", seg)
     if seg.startswith("[") and seg.endswith("]"):
-        return Arg("array", seg, start + (len(text[start:end]) - len(text[start:end].lstrip())))
-    return Arg("other")
+        return Arg("array", seg, seg_start)
+    if m := _VAR.match(seg):
+        name = m.group(1)
+        if name in _SUPERGLOBALS:
+            return Arg("source")
+        if name != "this":
+            return Arg("var", name, seg_start, seg_start + len(seg))
+    if re.match(r"^\$(?:_[A-Z]+|GLOBALS)\s*\[", seg) or _SOURCE_CALL.match(seg):
+        return Arg("source")
+    if m := _PROP.match(seg):
+        return Arg("prop", m.group(1), seg_start, seg_start + len(seg))
+    if (m := _CONST.match(seg)) and m.group(1).lower() not in _NOT_CONST:
+        return Arg("const", m.group(1), seg_start, seg_start + len(seg))
+    return Arg("other", "", seg_start, seg_start + len(seg))
 
 
 def _hostish(v: str) -> bool:
     return bool(_IP_RE.match(v) or _HOST_RE.match(v))
 
 
-def find_call_credentials(text: str) -> Iterator[CallMatch]:
-    for m in _USERPWD.finditer(text):
-        yield from _userpwd(m)
+@dataclass(frozen=True)
+class _Call:
+    kind: str  # "slots" or "conninfo"
+    start: int
+    args: list[Arg]
+    sink: Sink
+    rule_id: str
+    user_pos: int | None
+    pw_pos: int
+    generic: bool
+
+
+_REDIS = Sink(1, 2, "redis")
+
+
+def _iter_calls(text: str) -> Iterator[_Call]:
     for m in _CALL.finditer(text):
         name = m.group("name").lower()
         if name in _NOT_CREDENTIAL:
@@ -226,12 +279,18 @@ def find_call_credentials(text: str) -> Iterator[CallMatch]:
         if sink is None and name in _CONNINFO and not is_method:
             args = parse_args(text, m.end() - 1)
             if args and args[0].kind == "str":
-                yield from _conninfo(args[0])
+                yield _Call("conninfo", m.start(), args[:1], _db(None, 1), "php-db-connect", None, 1, False)
             continue
         if sink is None and name == _REDIS_AUTH and is_method:
             args = parse_args(text, m.end() - 1)
-            if args:
-                yield from _redis_auth(text, args)
+            if args and len(args) == 1 and args[0].kind == "array":
+                items = parse_args(text, args[0].start)
+                if not items or len(items) > 2:
+                    continue
+                args = items
+            if args and len(args) <= 2:
+                user_pos, pw_pos = (None, 1) if len(args) == 1 else (1, 2)
+                yield _Call("slots", m.start(), args, _REDIS, "php-auth-call", user_pos, pw_pos, False)
             continue
         if sink is None and not _CONNECT_NAME.match(name):
             continue
@@ -241,7 +300,7 @@ def find_call_credentials(text: str) -> Iterator[CallMatch]:
         if sink is not None:
             if len(args) >= sink.min_args:
                 rule = "php-db-connect" if sink.category is _DB else "php-auth-call"
-                yield from _emit(args, sink.user, sink.pw, rule, sink, generic=False)
+                yield _Call("slots", m.start(), args, sink, rule, sink.user, sink.pw, False)
             continue
         # Unknown connect-like wrapper: (user, pw) or (host, user, pw, ...).
         if any(a.kind == "num" for a in args[:3]) or len(args) < 2:
@@ -249,41 +308,57 @@ def find_call_credentials(text: str) -> Iterator[CallMatch]:
         if len(args) == 2 and args[0].kind == "str" and _hostish(args[0].value):
             continue  # (host, db) or (host, user): no password position
         user_pos, pw_pos = (1, 2) if len(args) == 2 else (2, 3)
-        yield from _emit(args, user_pos, pw_pos, "php-connect-call", _GENERIC, generic=True)
+        yield _Call("slots", m.start(), args, _GENERIC, "php-connect-call", user_pos, pw_pos, True)
 
 
-def _usable(a: Arg, generic: bool) -> bool:
+def iter_sink_slots(text: str, path: str) -> Iterator[SinkSlot]:
+    """Every user and password argument of every credential call in ``text``,
+    whatever the argument kind. Literal slots are Stage 1's
+    (:func:`find_call_credentials`); the others are for dataflow tracing."""
+    lines = _line_starts(text)
+    for c in _iter_calls(text):
+        if c.kind != "slots" or c.pw_pos > len(c.args):
+            continue
+        line = bisect.bisect_right(lines, c.start)
+        yield SinkSlot("password", c.args[c.pw_pos - 1], c.sink, path, line, c.start, c.generic)
+        if c.user_pos and c.user_pos <= len(c.args):
+            yield SinkSlot("user", c.args[c.user_pos - 1], c.sink, path, line, c.start, c.generic)
+
+
+def _line_starts(text: str) -> list[int]:
+    return [0] + [m.end() for m in re.finditer("\n", text)]
+
+
+def find_call_credentials(text: str) -> Iterator[CallMatch]:
+    for m in _USERPWD.finditer(text):
+        yield from _userpwd(m)
+    for c in _iter_calls(text):
+        if c.kind == "conninfo":
+            yield from _conninfo(c.args[0])
+        else:
+            yield from _emit(c.args, c.user_pos, c.pw_pos, c.rule_id, c.sink, generic=c.generic)
+
+
+def usable(a: Arg | str, generic: bool) -> bool:
+    """A literal that can be a credential in a call slot."""
     from ai_safe.detectors import _trivial_value  # local import: avoid cycle
 
-    return a.kind == "str" and bool(a.value.strip()) and not _trivial_value(a.value) and not (generic and _hostish(a.value))
+    v = a if isinstance(a, str) else (a.value if a.kind == "str" else "")
+    return bool(v.strip()) and not _trivial_value(v) and not (generic and _hostish(v))
 
 
-def _user_ok(a: Arg, generic: bool) -> bool:
-    return _usable(a, generic) and a.value.lower() not in _DEFAULT_USERS and not _hostish(a.value)
+def user_ok(a: Arg | str, generic: bool) -> bool:
+    v = a if isinstance(a, str) else a.value
+    return usable(a, generic) and v.lower() not in _DEFAULT_USERS and not _hostish(v)
 
 
 def _emit(args: list[Arg], user_pos: int | None, pw_pos: int, rule_id: str, sink: Sink, generic: bool) -> Iterator[CallMatch]:
-    if pw_pos > len(args) or not _usable(pw := args[pw_pos - 1], generic):
+    if pw_pos > len(args) or not usable(pw := args[pw_pos - 1], generic):
         return
     user_key, pw_key = sink.keys
     yield CallMatch(rule_id, "password", pw.start, pw.end, pw.value, sink.category, pw_key)
-    if user_pos and user_pos <= len(args) and _user_ok(u := args[user_pos - 1], generic):
+    if user_pos and user_pos <= len(args) and user_ok(u := args[user_pos - 1], generic):
         yield CallMatch(rule_id, "user", u.start, u.end, u.value, sink.category, user_key)
-
-
-_REDIS = Sink(1, 2, "redis")
-
-
-def _redis_auth(text: str, args: list[Arg]) -> Iterator[CallMatch]:
-    if len(args) == 1 and args[0].kind == "array":
-        items = parse_args(text, args[0].start)
-        if not items or len(items) > 2:
-            return
-        args = items
-    if len(args) == 1:
-        yield from _emit(args, None, 1, "php-auth-call", _REDIS, generic=False)
-    elif len(args) == 2:
-        yield from _emit(args, 1, 2, "php-auth-call", _REDIS, generic=False)
 
 
 def _userpwd(m: re.Match[str]) -> Iterator[CallMatch]:

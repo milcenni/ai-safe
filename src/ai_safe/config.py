@@ -130,6 +130,10 @@ class ScannerConfig(_Strict):
     )
     timeout_seconds: int = Field(default=900, ge=10)
     custom_rules: list[CustomRule] = Field(default_factory=list)
+    # Trace PHP credential-call arguments to their literals across variables,
+    # includes, constants and (with the optional 'php' extra) functions.
+    # auto: on, functions only when tree-sitter is installed; on: require it; off: disabled.
+    php_dataflow: Literal["auto", "on", "off"] = "auto"
 
     @field_validator("history_log_opts")
     @classmethod
