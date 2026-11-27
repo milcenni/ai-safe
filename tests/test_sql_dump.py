@@ -36,3 +36,11 @@ def test_hashed_and_placeholder_values_ignored():
     assert found(f"CREATE USER 'u'@'%' IDENTIFIED BY PASSWORD '{digest}';\n") == []
     assert found("-- CREATE USER 'u'@'%' IDENTIFIED BY 'your_password';\n") == []
     assert found("CREATE USER 'u'@'%' IDENTIFIED BY '${AI_SAFE_SECRET_DB_PASSWORD}';\n") == []
+
+
+def test_password_method_calls_are_not_sql():
+    """I4: form-builder password() calls must not be treated as SQL PASSWORD()."""
+    for text in ("{!! Form::password('password_confirmation') !!}\n",
+                 "<?php\n$form->password('user_password');\n",
+                 "field.password('new_password_field');\n"):
+        assert found(text) == [], text

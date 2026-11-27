@@ -111,3 +111,70 @@ def test_unrelated_calls_not_reported():
     u, p = up()
     text = f"<?php\n{WRAPPER}log_line('{u}', '{p}');\n"
     assert secrets({"a.php": text}) == set()
+
+
+# --- final review fixes -------------------------------------------------------
+
+def test_ast_scaling_with_method_calls():
+    """C1: method-call resolution and enclosing-function lookup must not be
+    quadratic in the number of functions."""
+    import time
+    texts = {}
+    for i in range(1000):
+        methods = "".join(f"  function m{j}($a, $b) {{ return $a . $b; }}\n" for j in range(10))
+        calls = "".join(f"$o->m{j % 10}('x{i}', 'y{j}');\n" for j in range(20))
+        texts[f"c{i}.php"] = (f"<?php\nclass C{i} {{\n{methods}}}\n{calls}"
+                              f"function w{i}($p) {{ return mysqli_connect('db', 'app', $p); }}\nw{i}('pw{i}x');\n")
+    t0 = time.monotonic()
+    findings, _ = trace_php(texts, ast=True)
+    assert time.monotonic() - t0 < 5.0
+    assert len(findings) == 1000
+
+
+def test_duplicate_class_definitions_all_indexed():
+    """I3: two copies of a class (admin/ and public/) must both be traced."""
+    _, p = up()
+    texts = {
+        "admin/Db.php": "<?php\nclass Db {\n  function c($x) { return strlen($x); }\n}\n",
+        "public/Db.php": "<?php\nclass Db {\n  function c($k) { return mysqli_connect('db', 'app', $k); }\n}\n",
+        "index.php": f"<?php\n$d = new Db();\n$d->c('{p}');\n",
+    }
+    assert secrets(texts) == {p}
+
+
+def test_deeply_nested_php_does_not_crash():
+    """I5: the AST walk must not recurse per nesting level."""
+    concat = "<?php\n$x = " + " . ".join(["'a'"] * 3000) + ";\n"
+    arrays = "<?php\n$x = " + "[" * 1200 + "]" * 1200 + ";\n"
+    elifs = "<?php\nif ($a) { $b = 1; }\n" + "".join(f"else if ($a == {i}) {{ $b = {i}; }}\n" for i in range(500))
+    for text in (concat, arrays, elifs):
+        trace_php({"a.php": text + WRAPPER}, ast=True)
+
+
+def test_dynamic_policy_respects_arity_and_skips_new_variable():
+    """I6: dynamic calls whose argument count cannot fit the target, and
+    `new $cls(...)`, are not credentials."""
+    a, b = up()
+    text = (f"<?php\n{WRAPPER}$h = $_GET['h'];\n$h('{a}', '{b}', 'third', 'fourth');\n"
+            f"$cls = $_GET['c'];\n$o = new $cls('{a}', '{b}');\n")
+    assert secrets({"a.php": text}) == set()
+
+
+def test_parent_and_literal_class_calls_resolve_exactly():
+    """I6: parent::__construct and Other::open must not match Db's methods."""
+    a, b = up()
+    text = ("<?php\nclass Db {\n  function __construct($u, $p) { $this->c = new PDO('x', $u, $p); }\n"
+            "  function open($u, $p) { return mysqli_connect('db', $u, $p); }\n}\n"
+            f"class Form extends BaseForm {{\n  function __construct() {{ parent::__construct('{a}', '{b}'); }}\n}}\n"
+            f"Other::open('{a}', '{b}');\n")
+    assert secrets({"a.php": text}) == set()
+
+
+def test_self_static_and_exact_class_calls_still_traced():
+    u, p = up()
+    text = ("<?php\nclass Db {\n  function open($u, $p) { return mysqli_connect('db', $u, $p); }\n"
+            f"  function boot() {{ return self::open('{u}', '{p}'); }}\n}}\n")
+    u2, p2 = up()
+    text2 = f"<?php\nclass Db {{\n  static function open($u, $p) {{ return mysqli_connect('db', $u, $p); }}\n}}\nDb::open('{u2}', '{p2}');\n"
+    assert secrets({"a.php": text}) == {u, p}
+    assert secrets({"b.php": text2}) == {u2, p2}

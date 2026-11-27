@@ -216,3 +216,39 @@ def test_php_dataflow_on_without_tree_sitter_fails_closed(monkeypatch):
     cfg.scanner.php_dataflow = "on"
     with pytest.raises(SecurityError):
         Scanner(cfg, b"s" * 32)
+
+
+# --- final review fixes -------------------------------------------------------
+
+def test_generic_wrapper_host_and_dbname_not_traced():
+    """I1: host/db/port/timeout variables passed to a *connect wrapper are not credentials."""
+    texts = {"a.php": ("<?php\n$host = 'database01';\n$dbname = 'shop_prod';\n$db->connect($host, $dbname);\n"
+                       "$port = '6379';\n$timeout = 'two_seconds';\n$r->connect($host, $port, $timeout);\n")}
+    assert trace_php(texts)[0] == []
+
+
+def test_generic_wrapper_credential_names_still_traced():
+    u, p = short_word(_R, 7), pw()
+    text = f"<?php\n$dbuser = '{u}';\n$dbpass = '{p}';\n$this->db->connect('db', $dbuser, $dbpass);\n"
+    assert secrets({"a.php": text}) == {u, p}
+
+
+def test_unresolved_variables_warn():
+    """I2: a credential argument that cannot be followed must not be silent."""
+    a, b = pw(), pw()
+    cases = {
+        "ternary.php": (f"<?php\n$k = $dev ? '{a}' : '{b}';\nmysqli_connect('db', 'app', $k);\n", "expression"),
+        "heredoc.php": (f"<?php\n$k = <<<EOT\n{a}\nEOT;\nmysqli_connect('db', 'app', $k);\n", "expression"),
+        "param.php": ("<?php\nfunction f($p) { return mysqli_connect('db', 'app', $p); }\n", "unresolved"),
+    }
+    for name, (text, reason) in cases.items():
+        findings, warnings = trace_php({name: text})
+        assert [w.reason for w in warnings] == [reason], name
+
+
+def test_globals_array_and_variable_copies_traced():
+    a, b, c = pw(), pw(), pw()
+    text = (f"<?php\n$GLOBALS['k'] = '{a}';\nmysqli_connect('db', 'app', $GLOBALS['k']);\n"
+            f"$orig = '{b}';\n$copy = $orig;\nmysqli_connect('db', 'app', $copy);\n"
+            f"const A = 1, K = '{c}';\nmysqli_connect('db', 'app', K);\n")
+    assert secrets({"a.php": text}) == {a, b, c}

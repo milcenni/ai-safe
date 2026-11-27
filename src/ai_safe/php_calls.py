@@ -206,7 +206,8 @@ def parse_args(text: str, open_idx: int) -> list[Arg] | None:
     return None
 
 
-_SUPERGLOBALS = {"_GET", "_POST", "_REQUEST", "_COOKIE", "_SERVER", "_ENV", "_FILES", "_SESSION", "GLOBALS"}
+_SUPERGLOBALS = {"_GET", "_POST", "_REQUEST", "_COOKIE", "_SERVER", "_ENV", "_FILES", "_SESSION"}
+_GLOBALS_KEY = re.compile(r"^\$GLOBALS\s*\[\s*(['\"])([A-Za-z_]\w*)\1\s*\]$")
 _SOURCE_CALL = re.compile(r"(?i)^\\?(?:getenv|env|config|ini_get|filter_input|apache_getenv)\s*\(")
 _VAR = re.compile(r"^\$([A-Za-z_]\w*)$")
 _PROP = re.compile(r"^(?:\$this\s*->\s*|(?:self|static)::\$)([A-Za-z_]\w*)$")
@@ -231,19 +232,29 @@ def _classify(text: str, start: int, end: int, literals: list[tuple[str, int, in
         return Arg("num", seg)
     if seg.startswith("[") and seg.endswith("]"):
         return Arg("array", seg, seg_start)
+    if m := _GLOBALS_KEY.match(seg):
+        return Arg("var", m.group(2), seg_start, seg_start + len(seg))  # $GLOBALS['x'] is $x
     if m := _VAR.match(seg):
         name = m.group(1)
         if name in _SUPERGLOBALS:
             return Arg("source")
         if name != "this":
             return Arg("var", name, seg_start, seg_start + len(seg))
-    if re.match(r"^\$(?:_[A-Z]+|GLOBALS)\s*\[", seg) or _SOURCE_CALL.match(seg):
+    if re.match(r"^\$_[A-Z]+\s*\[", seg) or _SOURCE_CALL.match(seg):
         return Arg("source")
     if m := _PROP.match(seg):
         return Arg("prop", m.group(1), seg_start, seg_start + len(seg))
     if (m := _CONST.match(seg)) and m.group(1).lower() not in _NOT_CONST:
         return Arg("const", m.group(1), seg_start, seg_start + len(seg))
     return Arg("other", "", seg_start, seg_start + len(seg))
+
+
+def classify_expression(seg: str) -> Arg:
+    """Kind of a standalone PHP expression (an assignment's right-hand side)."""
+    args = parse_args("(" + seg + ")", 0)
+    if not args or len(args) != 1:
+        return Arg("other")
+    return args[0]
 
 
 def _hostish(v: str) -> bool:
