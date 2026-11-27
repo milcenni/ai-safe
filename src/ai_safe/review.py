@@ -24,6 +24,7 @@ Review never executes anything from the workspace.
 
 from __future__ import annotations
 
+import difflib
 import re
 import stat
 from dataclasses import dataclass, field
@@ -35,6 +36,8 @@ from ai_safe.config import AISafeConfig
 from ai_safe.credential_map import CredentialMap
 from ai_safe.models import Category, Issue, Location, Severity, is_blocking
 from ai_safe.patch_manager import FileChange, collect_changes, compute_hunks, map_to_original
+from ai_safe.php_calls import is_php
+from ai_safe.php_dataflow import trace_php
 from ai_safe.scanner import Scanner
 from ai_safe.security import (
     GIT_SAFE_CONFIG,
@@ -155,6 +158,7 @@ def review_session(session: Session, cfg: AISafeConfig, scanner: Scanner, *, exc
     changes = collect_changes(snap, ws)
     report.changes = changes
     gitleaks_inputs: list[tuple[str, bytes]] = []
+    php_changes: dict[str, str] = {}
 
     added_paths = [c.path for c in changes if c.kind == "added"]
     try:
@@ -247,6 +251,8 @@ def review_session(session: Session, cfg: AISafeConfig, scanner: Scanner, *, exc
             report.add(Severity.WARNING, "executable", path, "new executable file - review before running anything")
 
         blocked = _scan_content(report, scanner, path, text_for_scan, fingerprints, salt)
+        if new_text is not None and is_php(path) and cfg.scanner.php_dataflow != "off":
+            php_changes[path] = new_text
         gitleaks_inputs.append((path, new_bytes))
 
         if new_text is not None:
@@ -266,6 +272,8 @@ def review_session(session: Session, cfg: AISafeConfig, scanner: Scanner, *, exc
         elif ch.kind in ("modified", "mode_changed"):
             _plan_modified(report, path, new_bytes, new_text, ch, session, manifest_files, repo, salt)
 
+    if php_changes:
+        _php_dataflow_checks(report, snap, php_changes)
     if scanner.gitleaks and gitleaks_inputs:
         _gitleaks_on_changes(report, scanner, gitleaks_inputs)
     if not report.passed:
@@ -279,6 +287,41 @@ def _safe(path: str) -> bool:
         return True
     except SecurityError:
         return False
+
+
+def _php_dataflow_checks(report: ReviewReport, snap: Path, changed: dict[str, str]) -> None:
+    """Credentials the AI wrote into PHP that reach a credential call only
+    through variables, includes or constants. Context comes from the
+    sanitized snapshot (ai-safe's own copy), overlaid with the changed files;
+    only literals on lines the AI added or changed are reported."""
+    texts: dict[str, str] = {}
+    for f in sorted(snap.rglob("*")):
+        rel = f.relative_to(snap).as_posix()
+        if is_php(rel) and f.is_file() and not f.is_symlink() and rel not in changed:
+            try:
+                texts[rel] = f.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+    texts.update(changed)
+    added_lines = {path: _added_lines(path, snap, text) for path, text in changed.items()}
+    for ff in trace_php(texts)[0]:
+        if ff.file in added_lines and ff.line in added_lines[ff.file]:
+            report.add(Severity.ERROR, "hardcoded-credential", ff.file,
+                       f"hardcoded credential introduced ({ff.rule_id}, {ff.category.value})", ff.line)
+
+
+def _added_lines(path: str, snap: Path, new_text: str) -> set[int]:
+    old = snap / path
+    try:
+        old_lines = old.read_text(encoding="utf-8").splitlines() if old.is_file() and not old.is_symlink() else []
+    except (OSError, UnicodeDecodeError):
+        old_lines = []
+    new_lines = new_text.splitlines()
+    out: set[int] = set()
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes():
+        if tag in ("insert", "replace"):
+            out.update(range(j1 + 1, j2 + 1))
+    return out
 
 
 def _scan_content(report, scanner: Scanner, path: str, text: str, fingerprints, salt: bytes) -> bool:

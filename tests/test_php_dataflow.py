@@ -109,3 +109,97 @@ def test_php_dataflow_off_disables_pass(make_repo):
     cfg.scanner.php_dataflow = "off"
     p = prepare(make_repo({"a.php": f"<?php\n$pw = '{p1}';\nmysqli_connect('db', 'app', $pw);\n"}), cfg)
     assert p1 in all_text(p.ws)
+
+
+# --- Task 4: include graph and globals ---------------------------------------
+
+def test_variables_from_required_config():
+    u, p = short_word(_R, 7), pw()
+    texts = {
+        "config.php": f"<?php\n$u = '{u}';\n$p = '{p}';\n",
+        "db.php": "<?php\nrequire 'config.php';\n$c = mysqli_connect('db', $u, $p);\n",
+    }
+    assert secrets(texts) == {u, p}
+
+
+def test_sibling_include_via_entry_file():
+    p = pw()
+    texts = {
+        "index.php": "<?php\ninclude 'config.php';\ninclude 'lib/db.php';\n",
+        "config.php": f"<?php\n$p = '{p}';\n",
+        "lib/db.php": "<?php\n$c = mysqli_connect('db', 'app', $p);\n",
+    }
+    assert secrets(texts) == {p}
+
+
+def test_dir_and_dirname_include_forms():
+    a, b = pw(), pw()
+    texts = {
+        "inc/config.php": f"<?php\n$a = '{a}';\n",
+        "config.php": f"<?php\n$b = '{b}';\n",
+        "app/db.php": ("<?php\nrequire_once __DIR__ . '/../inc/config.php';\n"
+                       "require_once(dirname(__FILE__) . '/../config.php');\n"
+                       "mysqli_connect('db', 'app', $a);\nmysqli_connect('db', 'app', $b);\n"),
+    }
+    assert secrets(texts) == {a, b}
+
+
+def test_global_in_function():
+    p = pw()
+    texts = {
+        "config.php": f"<?php\n$p = '{p}';\n",
+        "db.php": "<?php\nrequire 'config.php';\nfunction db() {\n  global $p;\n  return mysqli_connect('db', 'app', $p);\n}\n",
+    }
+    assert secrets(texts) == {p}
+
+
+def test_include_cycle_terminates():
+    p = pw()
+    texts = {
+        "a.php": f"<?php\ninclude 'b.php';\n$p = '{p}';\n",
+        "b.php": "<?php\ninclude 'a.php';\ninclude 'b.php';\nmysqli_connect('db', 'app', $p);\n",
+    }
+    assert secrets(texts) == {p}
+
+
+def test_unresolvable_include_falls_back_and_warns():
+    p = pw()
+    texts = {
+        "conf/settings.php": f"<?php\n$p = '{p}';\n",
+        "db.php": "<?php\ninclude $base . '/settings.php';\nmysqli_connect('db', 'app', $p);\n",
+    }
+    findings, warnings = trace_php(texts)
+    assert {f.secret for f in findings} == {p}
+    assert warnings == [FlowWarning("db.php", 3, "unresolved-include")]
+
+
+def test_unrelated_file_not_in_scope():
+    q = pw()
+    texts = {
+        "other.php": f"<?php\n$p = '{q}';\n",
+        "db.php": "<?php\nmysqli_connect('db', 'app', $p);\n",
+    }
+    assert secrets(texts) == set()
+
+
+def test_dataflow_scales_linearly():
+    import time
+    texts = {}
+    for i in range(2000):
+        texts[f"m{i}.php"] = (f"<?php\ninclude 'm{i + 1}.php';\n$v{i} = 'val{i}x';\n"
+                              f"$c = mysqli_connect('db', 'app', $v{(i + 3) % 2000});\n")
+    t0 = time.monotonic()
+    findings, _ = trace_php(texts)
+    assert time.monotonic() - t0 < 5.0
+    assert findings
+
+
+def test_review_blocks_ai_introduced_traced_credential(make_repo):
+    from ai_safe.review import review_session
+    from conftest import write
+    p = prepare(make_repo({"app/db.php": "<?php\n$c = 1;\n"}), builtin_config())
+    v = pw()
+    write(p.ws, {"app/db.php": f"<?php\n$c = 1;\n$pw = '{v}';\n$c = mysqli_connect('db', 'app', $pw);\n"})
+    rr = review_session(p.session, p.cfg, p.scanner)
+    assert any(i.code == "hardcoded-credential" and i.path == "app/db.php" for i in rr.issues)
+    assert not rr.passed

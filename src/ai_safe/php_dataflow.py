@@ -19,6 +19,7 @@ reported only when the same call's password resolved to a literal.
 from __future__ import annotations
 
 import bisect
+import posixpath
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -34,6 +35,52 @@ _PROPERTY = re.compile(
     r"\b(?:var|public|protected|private|static|readonly)\s+(?:(?:static|readonly)\s+)*(?:\??[\w\\]+\s+)?"
     r"\$(?P<name>[A-Za-z_]\w*)\s*=\s*" + _LIT + r"\s*;"
 )
+
+_INCLUDE = re.compile(r"(?<![\w$>:])(?:include|require)(?:_once)?\b\s*(?P<expr>[^;]{1,300});")
+_INC_LIT = r"(?P<q>['\"])(?P<path>[^'\"$\n]+)(?P=q)"
+_INC_FORMS = (
+    (re.compile(r"^\(?\s*" + _INC_LIT + r"\s*\)?$"), "plain"),
+    (re.compile(r"^\(?\s*__DIR__\s*\.\s*" + _INC_LIT + r"\s*\)?$"), "dir"),
+    (re.compile(r"^\(?\s*dirname\s*\(\s*__FILE__\s*\)\s*\.\s*" + _INC_LIT + r"\s*\)?$"), "dir"),
+    (re.compile(r"^\(?\s*dirname\s*\(\s*__DIR__\s*\)\s*\.\s*" + _INC_LIT + r"\s*\)?$"), "parent"),
+)
+MAX_INCLUDE_DEPTH = 8
+
+
+def include_graph(texts: dict[str, str]) -> tuple[dict[str, set[str]], set[str]]:
+    """Edges file -> included files (static paths that exist in ``texts``),
+    and the files that contain an include that could not be resolved."""
+    edges: dict[str, set[str]] = defaultdict(set)
+    unresolved: set[str] = set()
+    for rel, text in texts.items():
+        for m in _INCLUDE.finditer(text):
+            target = _resolve_include(rel, m.group("expr").strip(), texts)
+            if target is None:
+                unresolved.add(rel)
+            elif target != rel:
+                edges[rel].add(target)
+    return edges, unresolved
+
+
+def _resolve_include(rel: str, expr: str, texts: dict[str, str]) -> str | None:
+    for rx, form in _INC_FORMS:
+        m = rx.match(expr)
+        if not m:
+            continue
+        path = m.group("path")
+        here = posixpath.dirname(rel)
+        if form == "dir":
+            bases = [here]
+        elif form == "parent":
+            bases = [posixpath.dirname(here)]
+        else:  # include_path semantics: the including file's directory, then the root
+            bases = [here, ""]
+        for base in bases:
+            cand = posixpath.normpath(posixpath.join(base, path.lstrip("/") if form != "plain" else path))
+            if cand in texts:
+                return cand
+        return None
+    return None
 
 
 @dataclass(frozen=True)
@@ -107,6 +154,7 @@ def trace_php(texts: dict[str, str]) -> tuple[list[FlowFinding], list[FlowWarnin
     call in ``texts`` (rel path -> text; non-PHP files are ignored)."""
     texts = {rel: t for rel, t in texts.items() if is_php(rel)}
     index = _Index(texts)
+    scopes = _Scopes(texts)
     findings: dict[tuple[str, int, int], FlowFinding] = {}
     warnings: list[FlowWarning] = []
     for rel, text in sorted(texts.items()):
@@ -115,11 +163,21 @@ def trace_php(texts: dict[str, str]) -> tuple[list[FlowFinding], list[FlowWarnin
             calls[slot.call].append(slot)
         for slots in calls.values():
             resolved: dict[str, list[_Lit]] = {}
+            scope, truncated = scopes.of(rel)
             for slot in slots:
-                lits, warn = _resolve(slot, index, _scope(rel))
+                lits, warn = _resolve(slot, index, scope)
+                if not lits and not warn and slot.arg.kind in ("var", "prop") and scopes.has_unresolved(scope):
+                    # A dynamic include may bring the value in: look it up
+                    # repository-wide (over-approximate) and say so.
+                    lits = _resolve(slot, index, sorted(texts))[0]
+                    warn = "unresolved-include"
+                if not lits and not warn and truncated and slot.arg.kind in ("var", "prop"):
+                    warn = "depth-limit"
                 resolved[slot.role] = lits
                 if warn and slot.role == "password":
-                    warnings.append(FlowWarning(rel, slot.line, warn))
+                    w = FlowWarning(rel, slot.line, warn)
+                    if w not in warnings:
+                        warnings.append(w)
             generic = slots[0].generic
             pw = [lit for lit in resolved.get("password", []) if usable(lit.value, generic)]
             if not pw:
@@ -135,9 +193,42 @@ def trace_php(texts: dict[str, str]) -> tuple[list[FlowFinding], list[FlowWarnin
     return sorted(findings.values(), key=lambda f: (f.file, f.start)), warnings
 
 
-def _scope(rel: str) -> list[str]:
-    """Files whose top-level variables and properties are visible in ``rel``."""
-    return [rel]
+class _Scopes:
+    """Files whose variables and properties are visible in a file: its
+    undirected include-graph component (covers files included by a common
+    entry file), up to MAX_INCLUDE_DEPTH hops."""
+
+    def __init__(self, texts: dict[str, str]) -> None:
+        edges, self.unresolved = include_graph(texts)
+        self.adj: dict[str, set[str]] = defaultdict(set)
+        for a, targets in edges.items():
+            for b in targets:
+                self.adj[a].add(b)
+                self.adj[b].add(a)
+        self._cache: dict[str, tuple[list[str], bool]] = {}
+
+    def of(self, rel: str) -> tuple[list[str], bool]:
+        """(files in scope, depth limit hit)."""
+        if rel not in self._cache:
+            seen, frontier, truncated = {rel}, [rel], False
+            for depth in range(MAX_INCLUDE_DEPTH + 1):
+                nxt = []
+                for f in frontier:
+                    for g in self.adj.get(f, ()):
+                        if g not in seen:
+                            if depth == MAX_INCLUDE_DEPTH:
+                                truncated = True
+                                continue
+                            seen.add(g)
+                            nxt.append(g)
+                frontier = nxt
+                if not frontier:
+                    break
+            self._cache[rel] = (sorted(seen), truncated)
+        return self._cache[rel]
+
+    def has_unresolved(self, files: list[str]) -> bool:
+        return any(f in self.unresolved for f in files)
 
 
 def _resolve(slot: SinkSlot, index: _Index, scope: list[str]) -> tuple[list[_Lit], str | None]:
