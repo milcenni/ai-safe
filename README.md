@@ -2,6 +2,11 @@
 
 **Keep real credentials and Git history away from AI coding agents.**
 
+**Built for PHP projects** (legacy code as well as Laravel and CodeIgniter), and usable with any other
+language. For PHP, ai-safe follows credentials through variables, include files, constants and
+functions to the call that uses them (`mysqli_connect`, `new PDO`, `ftp_login`, …). For every language it
+detects tokens, keys, passwords in configuration, connection strings, private keys and email addresses.
+
 `ai-safe` gives an AI coding agent (Claude Code, Cursor, Copilot, …) a sanitized, verified copy of your
 repository. The agent works in that copy and never sees real credentials or the original Git history. You
 review what it changed, and you apply the reviewed changes to your real repository yourself, through a
@@ -26,18 +31,20 @@ Developer repo → discovery → classification → sanitization → AI workspac
 
 1. [Quick Start: ask your AI to install](#quick-start-ask-your-ai-to-install)
 2. [What ai-safe does](#what-ai-safe-does)
-3. [Threat model](#threat-model)
-4. [Architecture](#architecture)
-5. [Installation](#installation)
-6. [CLI usage](#cli-usage)
-7. [Claude Code integration](#claude-code-integration)
-8. [Configuration](#configuration)
-9. [Sanitization process](#sanitization-process)
-10. [Git history handling](#git-history-handling)
-11. [Security limitations](#security-limitations)
-12. [Recovery and cleanup](#recovery-and-cleanup)
-13. [Example workflow](#example-workflow)
-14. [Development and tests](#development-and-tests)
+3. [PHP projects](#php-projects)
+4. [Other languages](#other-languages)
+5. [Threat model](#threat-model)
+6. [Architecture](#architecture)
+7. [Installation](#installation)
+8. [CLI usage](#cli-usage)
+9. [Claude Code integration](#claude-code-integration)
+10. [Configuration](#configuration)
+11. [Sanitization process](#sanitization-process)
+12. [Git history handling](#git-history-handling)
+13. [Security limitations](#security-limitations)
+14. [Recovery and cleanup](#recovery-and-cleanup)
+15. [Example workflow](#example-workflow)
+16. [Development and tests](#development-and-tests)
 
 ---
 
@@ -47,7 +54,7 @@ Clone this repository, open an AI coding agent in it, and give it this prompt:
 
 > Install ai-safe for me (ask me global or local). If this project is not a Git repository, initialise Git
 > first. Add `.ai-safe/` and `.claude/settings.local*.json` to .gitignore. Ask me before changing
-> scan_ignored.
+> scan_ignored. For a PHP project, ask me whether to add the PHP tracing extra (`--php`).
 
 The agent follows [AGENTS.md](AGENTS.md) and asks before every download. Then run `ai-safe start` and
 `ai-safe open` yourself in a normal terminal.
@@ -75,7 +82,57 @@ compares against your updated repository.
 | Cleanup | `ai-safe cleanup` | Securely deletes workspaces, snapshots and mappings. |
 
 Credential categories: `API_KEY`, `ACCESS_TOKEN`, `PASSWORD`, `DATABASE_CREDENTIAL`, `PRIVATE_KEY`,
-`SSH_KEY`, `CLOUD_CREDENTIAL`, `JWT_SECRET`, `GENERIC_SECRET`.
+`SSH_KEY`, `CLOUD_CREDENTIAL`, `JWT_SECRET`, `GENERIC_SECRET`, plus `EMAIL` for email addresses
+(personal data, see `sanitization.sanitize_emails`).
+
+---
+
+## PHP projects
+
+Legacy PHP rarely keeps credentials in a `.env` file. They sit in `config.php`, in short variable names, in
+constants, or in the arguments of a home-grown `db_connect()`. ai-safe looks for them in four layers:
+
+| Layer | Finds | Example |
+|---|---|---|
+| Direct calls | Literals passed to a credential call | `mysqli_connect('db', 'app', 'pw')`, `new PDO($dsn, 'app', 'pw')`, `$this->db->connect('db', 'app', 'pw')` |
+| Variables, includes, constants | The literal behind a variable, an included config file, a constant or a property | `require 'config.php';` … `mysqli_connect($host, $u, $p)`; `define('X1', 'pw')`; `$this->pass` |
+| Functions (`--php` extra) | Literals passed through wrapper functions and methods, in any file | `open_db('app', 'pw')` → `function open_db($u, $p) { return new PDO('…', $u, $p); }`; `call_user_func('open_db', …)` |
+| Configuration | Key names and framework forms | `$db['default']['password'] = …` (CodeIgniter), `env('DB_PASSWORD', '…')` (Laravel), `define('DB_PASSWORD', …)` (WordPress), `$dbpass = …`, SQL dumps (`IDENTIFIED BY '…'`) |
+
+Covered calls: database connections (`PDO`, `mysqli`, `mysql_*`, `pg_connect`, `oci_*`, `odbc_*`,
+`mssql_*`, `db2_*`, `ibase_*`), `ftp_login`, `ldap_bind`, `imap_open` (IMAP and POP3),
+`ssh2_auth_password`, `->login()` (POP3/IMAP libraries, phpseclib), Redis `->auth()`, RabbitMQ
+`new AMQP*Connection`, Memcached `->setSaslAuthData`, AWS SDK `new Credentials()` (S3, MinIO),
+`CURLOPT_USERPWD`, and any function or method whose name ends in `connect`.
+
+Values that are read at runtime (`getenv()`, `$_ENV`, `$_POST`, `config()`) are not credentials in the code
+and are left alone. When ai-safe cannot follow an argument (for example `$a . $b`), `ai-safe scan` prints a
+warning with the file and line, so you can check it yourself.
+
+The function layer needs the optional PHP extra (tree-sitter, a Python package; PHP itself is not
+needed): `./install.sh --global --php`. Without it, the other layers still run.
+`scanner.php_dataflow: on` makes the extra mandatory, `off` disables tracing.
+
+On the legacy-PHP benchmark in `tests/legacy_corpus.py` (15 common patterns), all planted credentials are
+sanitized with the extra installed, and 89% (weighted) without it. That is a measure of the patterns we
+test, not of every project.
+
+---
+
+## Other languages
+
+Everything except the PHP tracing works for any language: Python, JavaScript/TypeScript, Java, Go, C#,
+Ruby, shell, configuration files and more.
+
+- Provider tokens (AWS, GitHub, GitLab, Slack, Stripe, OpenAI, Anthropic, …), JWTs and private keys
+- Passwords and secrets by key name, in code and in `.env`, YAML, JSON, INI, XML and properties files
+- Connection strings and URLs with credentials (`postgres://user:pw@host`, `Password=…;`)
+- Credentials in calls with a key (`setPassword('…')`, `HTTPBasicAuth('user', 'pw')`), in comments and in
+  CLI flags (`mysql -p…`, `--password=…`)
+- Email addresses and SQL dumps
+- Your own formats through `scanner.custom_rules`
+
+Gitleaks runs alongside the built-in engine, across the working tree and the full Git history.
 
 ---
 
@@ -164,6 +221,8 @@ flowchart LR
 | `classifier.py` | Credential categorization, sensitive-path matching, file kinds, key-name analysis |
 | `detectors.py` | Built-in detection engine: provider tokens, private keys, key/value assignments, YAML blocks, custom rules |
 | `php_calls.py` | Credentials passed as string literals to PHP calls: databases (`new PDO`, `mysqli_connect`, `pg_connect`, `$this->db->connect(...)`, …), FTP, LDAP, IMAP/POP3, SSH, Redis, AMQP, Memcached, AWS SDK (S3/MinIO), `CURLOPT_USERPWD` |
+| `php_dataflow.py` | PHP tracing: credential-call arguments followed to literals through variables, include graphs, constants and properties; with `php_ast`, through function parameters and call sites |
+| `php_ast.py` | Optional tree-sitter index of PHP functions, methods and call sites (`--php` extra) |
 | `gitleaks.py` | Hardened Gitleaks wrapper: forced config, ignore files and inline allows disabled, private shredded report |
 | `git_history.py` | Read-only Git access: file lists, staged and unstaged diffs, full-history added lines, commit messages, sanitized summaries |
 | `scanner.py` | Runs both engines across all locations. Deduplicates, classifies and fingerprints findings. |
@@ -187,6 +246,7 @@ Requirements: Python 3.11+ (3.12+ recommended), Git, and [Gitleaks](https://gith
 git clone <this repo> ai-safe && cd ai-safe
 ./install.sh --global                      # per-user: ~/.local/bin/ai-safe + ~/.claude/skills
 ./install.sh --local /path/to/your/project # or: inside one project (.ai-safe/ + .claude/skills)
+./install.sh --global --php                # PHP projects: add function tracing (tree-sitter)
 ```
 
 `install.sh` asks before downloading anything: Python packages from PyPI, and the official Gitleaks
@@ -197,7 +257,7 @@ Manual installation (development):
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev]"          # add ",php" for PHP function tracing: ".[dev,php]"
 
 # gitleaks: install from your package manager or the official release, then
 gitleaks version            # or set scanner.gitleaks_path / $AI_SAFE_GITLEAKS
@@ -347,6 +407,7 @@ scanner:
   scan_unstaged: true
   scan_commit_messages: true
   max_file_size_kb: 2048      # larger files are never copied (cannot be verified)
+  php_dataflow: auto          # PHP credential tracing: auto | on (needs the --php extra) | off
   custom_rules:
     - id: internal-service-token
       regex: "isvc_(?P<secret>[A-Za-z0-9]{32})"
@@ -502,21 +563,15 @@ passphrase for encrypted values. `AI_SAFE_DEBUG=1` shows tracebacks.
   concatenations, base64- or otherwise encoded values, secrets inside binaries, images or archives. Use
   `custom_rules` for organization-specific formats, and treat every scan result as "nothing *detected*",
   not "nothing present".
-- **Values passed through code are not traced.** In PHP files, credentials passed positionally are
-  recognised only when they are string literals in the call itself. Covered calls: database connections
-  (`new PDO`, `mysqli_connect`, `new mysqli`, `mysql_connect`, `oci_connect`, `odbc_connect`,
-  `pg_connect`, …), `ftp_login`, `ldap_bind`, `imap_open` (IMAP and POP3), `ssh2_auth_password`,
-  `->login(user, pw)` (POP3/IMAP libraries, phpseclib), Redis `->auth(...)`, `new AMQP*Connection`,
-  `->setSaslAuthData`, `new Credentials(key, secret)` (AWS SDK, S3, MinIO) and `CURLOPT_USERPWD`. A
-  literal passed to a wrapper that forwards it through variables, constants, arrays or other functions
-  is found only when the wrapper's name ends in `connect` (optionally followed by a version such as
-  `v2`). Unknown wrappers are assumed to take `(user, password)` or `(host, user, password, …)`.
-  Usernames are redacted only next to a literal password, and never when they are common defaults
-  (`root`, `postgres`, …) or host-like, because redaction replaces long values in every file. Laravel,
-  CodeIgniter, Kafka, MinIO and Guzzle configuration (`'password' => …`, `env('DB_PASSWORD', …)`,
-  `$db['default']['password'] = …`, `define('DB_PASSWORD', …)`, `->set('sasl.password', …)`,
-  `'auth' => ['user', 'pw']`, `.env`) is detected by key name.
-  Compound legacy names such as `$dbpass`, `$smtppwd` or `$mysqlpassword` count as password names.
+- **PHP tracing has limits.** ai-safe follows PHP credential-call arguments through variables, include
+  files with a static path, constants, properties and, with the `--php` extra, function and method
+  parameters (up to 8 hops). It does not follow array elements built at runtime, string concatenation,
+  `eval`, magic methods (`__call`), dependency-injection containers or `vendor/` code; those produce a
+  scan warning or nothing. When unsure it over-approximates: a method call on an object of unknown class
+  matches every method with that name, and a dynamic call (`$fn(...)`) next to a credential-reaching
+  function has its literals sanitized. Usernames are redacted only next to a literal password, and never
+  when they are common defaults (`root`, `postgres`, …) or host-like, because redaction replaces long
+  values in every file. Other languages get pattern and key-name detection only (no tracing).
 - **Email addresses** (internal staff, customers) are personal data and are replaced by default
   (`sanitization.sanitize_emails: true`), with placeholders like every credential. Code that validates
   email format therefore sees a placeholder in the workspace. Not replaced: documentation domains
@@ -619,7 +674,7 @@ ai-safe cleanup --yes
 ## Development and tests
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,php]"        # php: tree-sitter, for the PHP function-tracing tests
 pytest -q                          # gitleaks tests run if gitleaks is installed / $AI_SAFE_GITLEAKS is set
 ```
 

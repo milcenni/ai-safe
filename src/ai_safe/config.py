@@ -364,6 +364,7 @@ scanner:
   scan_unstaged: true
   scan_commit_messages: true
   max_file_size_kb: 2048
+  php_dataflow: auto          # PHP credential tracing: auto | on (needs --php extra) | off
   custom_rules: []
   # custom_rules:
   #   - id: internal-service-token
