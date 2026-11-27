@@ -12,8 +12,8 @@ from legacy_corpus import NOT_SECRETS, PATTERNS, Pattern
 from ai_safe import php_ast  # noqa: E402
 
 # Phase C (function tracing) needs the optional tree-sitter extra.
-IMPLEMENTED_PHASES = {"stage1", "A", "B1", "B"} | ({"C"} if php_ast.available() else set())
-RECALL_FLOOR = 0.97 if php_ast.available() else 0.86
+IMPLEMENTED_PHASES = {"stage1", "A", "B1", "B", "D"} | ({"C"} if php_ast.available() else set())
+RECALL_FLOOR = 1.00 if php_ast.available() else 0.89
 
 _R = random.Random(2026)
 

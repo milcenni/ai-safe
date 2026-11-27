@@ -78,6 +78,9 @@ TOKEN_RULES: tuple[TokenRule, ...] = (
     TokenRule("query-password", _r(r"(?i)[?&;](?:password|passwd|pwd|pass|secret|token|api_?key|access_token)=(?P<secret>[^&;\s\"'`#]{1,256})"), Category.PASSWORD),
     TokenRule("connection-string-password", _r(r"(?i)(?:;[ \t]*(?:password|pwd)[ \t]*=[ \t]*(?P<secret>[^;\"'`\n]{1,256})(?=;|[\"'`]|$)|(?:^|[\"'`])[ \t]*(?:password|pwd)[ \t]*=[ \t]*(?P<secret2>[^;\"'`\n]{1,256})(?=;))", re.MULTILINE), Category.DATABASE_CREDENTIAL),
     TokenRule("cli-password-flag", _r(r"(?:^|\s)--password(?:=|\s+)(?P<q>[\"']?)(?P<secret>[^\s\"'`;|&]{1,256})(?P=q)", re.MULTILINE), Category.PASSWORD),
+    TokenRule("sql-identified-by", _r(r"(?i)\bIDENTIFIED\s+(?:WITH\s+\w+\s+)?BY\s+(?P<q>['\"])(?P<secret>(?:\\.|(?!(?P=q))[^\\\n]){1,256})(?P=q)"), Category.DATABASE_CREDENTIAL),
+    TokenRule("sql-password-func", _r(r"(?i)\bPASSWORD\s*\(\s*(?P<q>['\"])(?P<secret>(?:\\.|(?!(?P=q))[^\\\n]){1,256})(?P=q)\s*\)"), Category.DATABASE_CREDENTIAL),
+    TokenRule("sql-set-password", _r(r"(?i)\bSET\s+PASSWORD\s+(?:FOR\s+\S+\s+)?=\s*(?P<q>['\"])(?P<secret>(?:\\.|(?!(?P=q))[^\\\n]){1,256})(?P=q)"), Category.DATABASE_CREDENTIAL),
     TokenRule("mysql-p-flag", _r(r"\bmysql\w*\b[^\n]*?\s-p(?P<secret>[^\s\"'`;|&<>]{1,256})"), Category.DATABASE_CREDENTIAL),
     TokenRule("sshpass-flag", _r(r"\bsshpass\s+-p\s*(?P<q>[\"']?)(?P<secret>[^\s\"']{1,256})(?P=q)"), Category.PASSWORD),
     TokenRule("curl-user", _r(r"\bcurl\b[^\n]*?\s(?:-u|--user)[ =]?(?P<q>[\"']?)[^\s:\"']+:(?P<secret>[^\s\"']{1,256})(?P=q)"), Category.PASSWORD),
@@ -154,7 +157,7 @@ _REFERENCE_PATTERNS = (
 
 _CONTEXT_TOKEN_RULES = {
     "url-credentials", "query-password", "connection-string-password", "cli-password-flag",
-    "mysql-p-flag", "sshpass-flag", "curl-user",
+    "mysql-p-flag", "sshpass-flag", "curl-user", "sql-identified-by", "sql-password-func", "sql-set-password",
 }
 
 
