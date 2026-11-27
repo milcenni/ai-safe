@@ -5,19 +5,18 @@ runtime; short low-entropy passwords are used on purpose, because the call
 context alone identifies them."""
 
 import random
-import string
 
 import pytest
 
 from ai_safe.detectors import BuiltinDetector
-from conftest import all_text, prepare
+from conftest import all_text, prepare, short_word
 
 _R = random.Random(20261127)
 
 
 def word(n: int = 5) -> str:
     """Short lowercase value such as a weak real-world password."""
-    return "".join(_R.choice(string.ascii_lowercase) for _ in range(n))
+    return short_word(_R, n)
 
 
 def found(text: str, path: str = "db.php") -> list[str]:

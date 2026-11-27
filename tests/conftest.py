@@ -55,6 +55,11 @@ class Fake:
         return f"-----BEGIN {label}-----\n{body}\n-----END {label}-----"
 
 
+def short_word(rng: random.Random, n: int = 5) -> str:
+    """Short lowercase value, like a weak real-world password or a username."""
+    return "".join(rng.choice(string.ascii_lowercase) for _ in range(n))
+
+
 @pytest.fixture
 def fake() -> Fake:
     return Fake(42)
