@@ -203,3 +203,16 @@ def test_review_blocks_ai_introduced_traced_credential(make_repo):
     rr = review_session(p.session, p.cfg, p.scanner)
     assert any(i.code == "hardcoded-credential" and i.path == "app/db.php" for i in rr.issues)
     assert not rr.passed
+
+
+def test_php_dataflow_on_without_tree_sitter_fails_closed(monkeypatch):
+    import pytest
+
+    from ai_safe import php_ast
+    from ai_safe.scanner import Scanner
+    from ai_safe.security import SecurityError
+    monkeypatch.setattr(php_ast, "available", lambda: False)
+    cfg = builtin_config()
+    cfg.scanner.php_dataflow = "on"
+    with pytest.raises(SecurityError):
+        Scanner(cfg, b"s" * 32)

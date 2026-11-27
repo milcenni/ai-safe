@@ -9,8 +9,11 @@ import pytest
 from conftest import all_text, prepare, short_word
 from legacy_corpus import NOT_SECRETS, PATTERNS, Pattern
 
-IMPLEMENTED_PHASES = {"stage1", "A", "B1", "B"}
-RECALL_FLOOR = 0.86
+from ai_safe import php_ast  # noqa: E402
+
+# Phase C (function tracing) needs the optional tree-sitter extra.
+IMPLEMENTED_PHASES = {"stage1", "A", "B1", "B"} | ({"C"} if php_ast.available() else set())
+RECALL_FLOOR = 0.97 if php_ast.available() else 0.86
 
 _R = random.Random(2026)
 
@@ -23,6 +26,8 @@ def _leaks(pattern: Pattern, make_repo) -> bool:
 
 @pytest.mark.parametrize("pattern", PATTERNS, ids=lambda p: p.name)
 def test_pattern_never_reaches_workspace(pattern, make_repo, request):
+    if pattern.phase == "C" and not php_ast.available():
+        pytest.skip("phase C needs the optional 'php' extra (tree-sitter)")
     if pattern.phase not in IMPLEMENTED_PHASES:
         request.applymarker(pytest.mark.xfail(strict=True, reason=f"phase {pattern.phase}"))
     assert not _leaks(pattern, make_repo)

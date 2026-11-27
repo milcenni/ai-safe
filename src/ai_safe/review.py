@@ -273,7 +273,7 @@ def review_session(session: Session, cfg: AISafeConfig, scanner: Scanner, *, exc
             _plan_modified(report, path, new_bytes, new_text, ch, session, manifest_files, repo, salt)
 
     if php_changes:
-        _php_dataflow_checks(report, snap, php_changes)
+        _php_dataflow_checks(report, snap, php_changes, ast=scanner.php_ast)
     if scanner.gitleaks and gitleaks_inputs:
         _gitleaks_on_changes(report, scanner, gitleaks_inputs)
     if not report.passed:
@@ -289,7 +289,7 @@ def _safe(path: str) -> bool:
         return False
 
 
-def _php_dataflow_checks(report: ReviewReport, snap: Path, changed: dict[str, str]) -> None:
+def _php_dataflow_checks(report: ReviewReport, snap: Path, changed: dict[str, str], *, ast: bool) -> None:
     """Credentials the AI wrote into PHP that reach a credential call only
     through variables, includes or constants. Context comes from the
     sanitized snapshot (ai-safe's own copy), overlaid with the changed files;
@@ -304,7 +304,7 @@ def _php_dataflow_checks(report: ReviewReport, snap: Path, changed: dict[str, st
                 continue
     texts.update(changed)
     added_lines = {path: _added_lines(path, snap, text) for path, text in changed.items()}
-    for ff in trace_php(texts)[0]:
+    for ff in trace_php(texts, ast=ast)[0]:
         if ff.file in added_lines and ff.line in added_lines[ff.file]:
             report.add(Severity.ERROR, "hardcoded-credential", ff.file,
                        f"hardcoded credential introduced ({ff.rule_id}, {ff.category.value})", ff.line)

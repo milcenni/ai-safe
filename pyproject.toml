@@ -21,6 +21,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# PHP function/method parameter tracing (scanner.php_dataflow); optional.
+php = ["tree-sitter>=0.23", "tree-sitter-php>=0.23"]
 
 [project.scripts]
 ai-safe = "ai_safe.cli:main"

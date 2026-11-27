@@ -10,6 +10,9 @@
 #   --no-gitleaks    do not install gitleaks (ai-safe then refuses to run until gitleaks is
 #                    available or you explicitly set scanner.engine: builtin)
 #   --force          overwrite an existing installation / ai-safe skills
+#   --php            also install the optional PHP function tracing extra (tree-sitter,
+#                    tree-sitter-php from PyPI); without it PHP tracing covers variables,
+#                    includes and constants only
 #
 # Nothing is installed system-wide and no sudo is used. Supported: Linux and macOS (x64/arm64).
 set -euo pipefail
@@ -22,6 +25,7 @@ YES=0
 WITH_GITLEAKS=1
 FORCE=0
 UNINSTALL=0
+WITH_PHP=0
 
 say()  { printf '\033[1;36m[ai-safe]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[ai-safe] warning:\033[0m %s\n' "$*" >&2; }
@@ -38,6 +42,7 @@ while [ $# -gt 0 ]; do
     --yes|-y) YES=1 ;;
     --no-gitleaks) WITH_GITLEAKS=0 ;;
     --force) FORCE=1 ;;
+    --php) WITH_PHP=1 ;;
     --uninstall) UNINSTALL=1 ;;
     -h|--help) usage 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
@@ -123,7 +128,9 @@ say "mode: $MODE"
 say "python: $PY ($("$PY" -V 2>&1))"
 say "install dir: $DATA_DIR"
 
-confirm "Download and install ai-safe's Python dependencies (typer, rich, pydantic, PyYAML, cryptography) from PyPI into $VENV?" \
+PY_DEPS="typer, rich, pydantic, PyYAML, cryptography"
+[ "$WITH_PHP" = 1 ] && PY_DEPS="$PY_DEPS, tree-sitter, tree-sitter-php"
+confirm "Download and install ai-safe's Python dependencies ($PY_DEPS) from PyPI into $VENV?" \
   || die "dependency installation not approved - nothing was installed"
 
 # ---------------------------------------------------------- python pkg ----
@@ -132,7 +139,11 @@ chmod 700 "$DATA_DIR"
 rm -rf "$VENV"
 "$PY" -m venv "$VENV"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip
-"$VENV/bin/python" -m pip install --quiet "$SRC_DIR"
+if [ "$WITH_PHP" = 1 ]; then
+  "$VENV/bin/python" -m pip install --quiet "$SRC_DIR[php]"
+else
+  "$VENV/bin/python" -m pip install --quiet "$SRC_DIR"
+fi
 say "installed ai-safe into $VENV"
 
 # ------------------------------------------------------------ gitleaks ----

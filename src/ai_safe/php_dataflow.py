@@ -22,10 +22,10 @@ import bisect
 import posixpath
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ai_safe.models import Category
-from ai_safe.php_calls import SinkSlot, is_php, iter_sink_slots, usable, user_ok
+from ai_safe.php_calls import Arg, Sink, SinkSlot, is_php, iter_sink_slots, usable, user_ok
 
 _LIT = r"(?P<q>['\"])(?P<val>(?:\\.|(?!(?P=q))[^\\\n])*)(?P=q)"
 _ASSIGN = re.compile(r"(?<![\w$>:])\$(?P<name>[A-Za-z_]\w*)\s*=(?![=>])\s*" + _LIT + r"\s*;")
@@ -149,48 +149,146 @@ def _lit(rel: str, m: re.Match[str]) -> _Lit | None:
     return _Lit(rel, s, e, value)
 
 
-def trace_php(texts: dict[str, str]) -> tuple[list[FlowFinding], list[FlowWarning]]:
+MAX_TRACE_DEPTH = 8
+
+
+@dataclass
+class _Group:
+    """User/password literals that reach one credential call."""
+
+    sink: Sink
+    generic: bool
+    lits: dict[str, list[_Lit]] = field(default_factory=lambda: {"password": [], "user": []})
+
+
+def trace_php(texts: dict[str, str], *, ast: bool = False) -> tuple[list[FlowFinding], list[FlowWarning]]:
     """Trace every non-literal user/password argument of every credential
-    call in ``texts`` (rel path -> text; non-PHP files are ignored)."""
+    call in ``texts`` (rel path -> text; non-PHP files are ignored). With
+    ``ast=True`` (tree-sitter installed), parameters are also traced to the
+    arguments of every call site of their function."""
     texts = {rel: t for rel, t in texts.items() if is_php(rel)}
     index = _Index(texts)
     scopes = _Scopes(texts)
-    findings: dict[tuple[str, int, int], FlowFinding] = {}
+    groups: dict[tuple, _Group] = {}
     warnings: list[FlowWarning] = []
+
+    def warn(rel: str, line: int, reason: str) -> None:
+        w = FlowWarning(rel, line, reason)
+        if w not in warnings:
+            warnings.append(w)
+
+    def resolve_in(rel: str, arg, line: int, role: str) -> list[_Lit]:
+        scope, truncated = scopes.of(rel)
+        lits, reason = _resolve(arg, index, scope)
+        if not lits and not reason and arg.kind in ("var", "prop") and scopes.has_unresolved(scope):
+            lits, reason = _resolve(arg, index, sorted(texts))[0], "unresolved-include"
+        if not lits and not reason and truncated and arg.kind in ("var", "prop"):
+            reason = "depth-limit"
+        if reason and role == "password":
+            warn(rel, line, reason)
+        return lits
+
+    slots_by_group: dict[tuple, list[SinkSlot]] = defaultdict(list)
     for rel, text in sorted(texts.items()):
-        calls: dict[int, list[SinkSlot]] = defaultdict(list)
         for slot in iter_sink_slots(text, rel):
-            calls[slot.call].append(slot)
-        for slots in calls.values():
-            resolved: dict[str, list[_Lit]] = {}
-            scope, truncated = scopes.of(rel)
-            for slot in slots:
-                lits, warn = _resolve(slot, index, scope)
-                if not lits and not warn and slot.arg.kind in ("var", "prop") and scopes.has_unresolved(scope):
-                    # A dynamic include may bring the value in: look it up
-                    # repository-wide (over-approximate) and say so.
-                    lits = _resolve(slot, index, sorted(texts))[0]
-                    warn = "unresolved-include"
-                if not lits and not warn and truncated and slot.arg.kind in ("var", "prop"):
-                    warn = "depth-limit"
-                resolved[slot.role] = lits
-                if warn and slot.role == "password":
-                    w = FlowWarning(rel, slot.line, warn)
-                    if w not in warnings:
-                        warnings.append(w)
-            generic = slots[0].generic
-            pw = [lit for lit in resolved.get("password", []) if usable(lit.value, generic)]
-            if not pw:
-                continue
-            users = [lit for lit in resolved.get("user", []) if user_ok(lit.value, generic)]
-            user_key, pw_key = slots[0].sink.keys
-            for role, lits, key in (("password", pw, pw_key), ("user", users, user_key)):
-                for lit in lits:
-                    k = (lit.file, lit.start, lit.end)
-                    if k not in findings:
-                        findings[k] = FlowFinding(lit.file, lit.start, lit.end, index.line(lit.file, lit.start),
-                                                  lit.value, role, slots[0].sink.category, key)
+            gid = (rel, slot.call)
+            slots_by_group[gid].append(slot)
+            group = groups.setdefault(gid, _Group(slot.sink, slot.generic))
+            group.lits[slot.role].extend(resolve_in(rel, slot.arg, slot.line, slot.role))
+
+    if ast:
+        _trace_parameters(texts, groups, slots_by_group, resolve_in, warn)
+
+    findings: dict[tuple[str, int, int], FlowFinding] = {}
+    for group in groups.values():
+        pw = [lit for lit in group.lits["password"] if usable(lit.value, group.generic)]
+        if not pw:
+            continue
+        users = [lit for lit in group.lits["user"] if user_ok(lit.value, group.generic)]
+        user_key, pw_key = group.sink.keys
+        for role, lits, key in (("password", pw, pw_key), ("user", users, user_key)):
+            for lit in lits:
+                k = (lit.file, lit.start, lit.end)
+                if k not in findings:
+                    findings[k] = FlowFinding(lit.file, lit.start, lit.end, index.line(lit.file, lit.start),
+                                              lit.value, role, group.sink.category, key)
     return sorted(findings.values(), key=lambda f: (f.file, f.start)), warnings
+
+
+def _trace_parameters(texts, groups, slots_by_group, resolve_in, warn) -> None:
+    """Worklist over (function, parameter index, role, group): a parameter
+    that reaches a credential call is traced to the matching argument of
+    every call site of its function, recursively (depth-limited)."""
+    from ai_safe import php_ast
+
+    funcs, calls = php_ast.index_php(texts)
+    by_callee: dict[str, list] = defaultdict(list)
+    for cs in calls:
+        for key in php_ast.resolve_keys(cs.callee_keys, funcs):
+            by_callee[key].append(cs)
+
+    def enclosing(rel: str, offset: int):
+        best = None
+        for f in funcs.values():
+            if f.file == rel and f.body_span[0] <= offset < f.body_span[1]:
+                if best is None or f.body_span[1] - f.body_span[0] < best.body_span[1] - best.body_span[0]:
+                    best = f
+        return best
+
+    work: list[tuple[str, int, str, tuple, int]] = []
+    for gid, slots in slots_by_group.items():
+        for slot in slots:
+            if slot.arg.kind != "var":
+                continue
+            f = enclosing(slot.file, slot.call)
+            if f is not None and slot.arg.value in f.params:
+                work.append((f.key, f.params.index(slot.arg.value), slot.role, gid, 1))
+
+    seen: set[tuple[str, int, str, tuple]] = set()
+    while work:
+        fkey, idx, role, gid, depth = work.pop()
+        if (fkey, idx, role, gid) in seen:
+            continue
+        seen.add((fkey, idx, role, gid))
+        fdef = funcs[fkey]
+        group = groups[gid]
+        if idx in fdef.defaults:
+            s, e, value = fdef.defaults[idx]
+            group.lits[role].append(_Lit(fdef.file, s, e, value))
+        for cs in by_callee.get(fkey, ()):
+            if idx >= len(cs.args):
+                continue
+            arg = cs.args[idx]
+            if arg.kind == "str":
+                group.lits[role].append(_Lit(cs.file, arg.start, arg.end, arg.value))
+                continue
+            group.lits[role].extend(resolve_in(cs.file, arg, cs.line, role))
+            caller = funcs.get(cs.enclosing) if cs.enclosing else None
+            if arg.kind == "var" and caller is not None and arg.value in caller.params:
+                if depth >= MAX_TRACE_DEPTH:
+                    if role == "password":
+                        warn(cs.file, cs.line, "depth-limit")
+                    continue
+                work.append((caller.key, caller.params.index(arg.value), role, gid, depth + 1))
+
+    # Dynamic calls whose target cannot be resolved: report their literals
+    # at the positions of every credential-reaching parameter (decision 7a).
+    reaching = sorted({(fkey, idx, role, gid) for fkey, idx, role, gid in seen})
+    for cs in calls:
+        if not cs.dynamic or not reaching:
+            continue
+        hit = False
+        for fkey, idx, role, gid in reaching:
+            if idx < len(cs.args) and cs.args[idx].kind == "str":
+                dyn = ("dynamic", cs.file, cs.start, gid)
+                group = groups.setdefault(dyn, _Group(groups[gid].sink, groups[gid].generic))
+                arg = cs.args[idx]
+                lit = _Lit(cs.file, arg.start, arg.end, arg.value)
+                if lit not in group.lits[role]:
+                    group.lits[role].append(lit)
+                hit = hit or role == "password"
+        if hit:
+            warn(cs.file, cs.line, "unresolved-dynamic-call")
 
 
 class _Scopes:
@@ -231,8 +329,7 @@ class _Scopes:
         return any(f in self.unresolved for f in files)
 
 
-def _resolve(slot: SinkSlot, index: _Index, scope: list[str]) -> tuple[list[_Lit], str | None]:
-    arg = slot.arg
+def _resolve(arg: Arg, index: _Index, scope: list[str]) -> tuple[list[_Lit], str | None]:
     if arg.kind == "var":
         return [lit for f in scope for lit in index.assigns[f].get(arg.value, [])], None
     if arg.kind == "prop":

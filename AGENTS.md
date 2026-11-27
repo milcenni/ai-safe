@@ -47,7 +47,10 @@ Follow these steps in order, and ask the user before each decision. Never assume
    Run `git init` only after asking the user. Never create commits for them.
 3. **Ask for consent to download.** The installer fetches Python packages from PyPI (typer, rich,
    pydantic, PyYAML, cryptography). It also downloads the official Gitleaks release from GitHub, unless
-   Gitleaks 8.19+ is already installed, and verifies its SHA-256 checksum.
+   Gitleaks 8.19+ is already installed, and verifies its SHA-256 checksum. For PHP projects, also ask
+   whether to install the optional PHP tracing extra (`--php`: tree-sitter and tree-sitter-php from
+   PyPI). It traces credentials through PHP functions and methods; without it, PHP tracing covers
+   variables, includes and constants only.
 4. **Run the installer** from this repository's root. Pass `--yes` only after the user agreed in step 3.
 
    ```bash
@@ -55,7 +58,8 @@ Follow these steps in order, and ask the user before each decision. Never assume
    ./install.sh --local /path/to/project --yes
    ```
 
-   Useful flags: `--no-gitleaks` (the user declines the Gitleaks download), `--force` (reinstall or
+   Useful flags: `--php` (the user agreed to the PHP tracing extra), `--no-gitleaks` (the user declines
+   the Gitleaks download), `--force` (reinstall or
    overwrite the ai-safe skills), `--uninstall --global|--local DIR`.
 5. **Ask before setting `scanner.scan_ignored`.** The default (`true`) scans files that `.gitignore`
    ignores. If the user wants `false`, set it in `ai-safe.yaml` only after they say so, and keep

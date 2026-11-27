@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ai_safe import git_history as gh
+from ai_safe import php_ast
 from ai_safe.classifier import ClaudePath, categorize, claude_path_policy, is_pristine_ai_safe_skill
 from ai_safe.config import AISafeConfig
 from ai_safe.detectors import BuiltinDetector, key_before
@@ -88,6 +89,9 @@ class Scanner:
         if gitleaks is None and cfg.scanner.engine == "gitleaks":
             gitleaks = Gitleaks.require(cfg.scanner.gitleaks_path, cfg.scanner.timeout_seconds)
         self.gitleaks = gitleaks
+        if cfg.scanner.php_dataflow == "on":
+            php_ast.require()  # fail closed: function tracing was explicitly required
+        self.php_ast = cfg.scanner.php_dataflow != "off" and php_ast.available()
 
     # ------------------------------------------------------------------
     # Finding construction
@@ -253,7 +257,7 @@ class Scanner:
 
         # 1b. PHP dataflow: credential-call arguments traced across the working tree
         if self.cfg.scanner.php_dataflow != "off":
-            flow, flow_warnings = trace_php(texts)
+            flow, flow_warnings = trace_php(texts, ast=self.php_ast)
             for ff in flow:
                 findings.append(self._finding(
                     rule_id=ff.rule_id, category=ff.category, file=ff.file, line=ff.line, end_line=ff.line,
