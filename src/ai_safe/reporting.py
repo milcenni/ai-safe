@@ -54,6 +54,12 @@ def render_scan(result, c: Console, max_rows: int = 200) -> None:
         f"Findings: {s['total']}   Unique secrets: {s['unique_secrets']}",
         title="ai-safe scan", border_style="cyan",
     ))
+    if "gitleaks" not in result.engines:
+        c.print("[yellow]Engines: builtin only[/yellow] (Gitleaks did not run; scanner.engine is 'builtin').")
+    for w in result.warnings[:30]:
+        c.print(f"[yellow]warning:[/yellow] {_u(w)}")
+    if len(result.warnings) > 30:
+        c.print(f"... {len(result.warnings) - 30} more warning(s) in the JSON report")
     if not result.findings:
         c.print("[green]No secrets detected.[/green] (Pattern matching cannot prove absence - see README limitations.)")
         return
@@ -137,5 +143,9 @@ def render_review(report, c: Console) -> None:
     for s in report.skipped:
         c.print(f"[dim]skipped:[/dim] {_u(s)}")
     render_issues("Review", report.issues, c, report.passed)
+    if getattr(report, "selected", None) is not None:
+        left = report.left_out()
+        c.print(f"Selected: {len(report.plan)} change(s) to integrate; {len(left)} left in the workspace. "
+                "Errors in files that are not selected do not block (they are not written).")
     if report.passed and report.plan:
         c.print(f"{len(report.plan)} change(s) can be integrated with `ai-safe integrate` (run by the developer).")

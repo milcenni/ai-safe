@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 
 from ai_safe.models import Category
 from ai_safe.classifier import is_sensitive_key, key_words
-from ai_safe.php_calls import Arg, Sink, SinkSlot, classify_expression, is_php, iter_sink_slots, usable, user_ok
+from ai_safe.php_calls import Arg, Sink, SinkSlot, classify_expression, fold_literal, is_php, iter_sink_slots, usable, user_ok
 
 _LIT = r"(?P<q>['\"])(?P<val>(?:\\.|(?!(?P=q))[^\\\n])*)(?P=q)"
 _ASSIGN = re.compile(r"(?<![\w$>:])\$(?P<name>[A-Za-z_]\w*)\s*=(?![=>])\s*" + _LIT + r"\s*;")
@@ -142,6 +142,10 @@ class _Index:
                 rhs = m.group("rhs").strip()
                 if _LONE_LIT.fullmatch(rhs) and not (rhs[0] == '"' and "$" in rhs):
                     continue  # a literal: indexed above with exact offsets
+                if folded := fold_literal(text, *m.span("rhs")):
+                    # fallback literal (``getenv('X') ?: 'v'``) or constant concatenation
+                    self.assigns[rel][m.group("name")].append(_Lit(rel, folded[1], folded[2], folded[0]))
+                    continue
                 self.others[rel][m.group("name")].append(classify_expression(rhs))
             for rx in (_PROPERTY, _THIS_ASSIGN):
                 for m in rx.finditer(text):

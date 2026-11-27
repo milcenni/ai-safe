@@ -215,12 +215,92 @@ _CONST = re.compile(r"^(?:(?:self|static|\\?[A-Za-z_][\w\\]*)::)?\\?([A-Za-z_]\w
 _NOT_CONST = {"true", "false", "null"}
 
 
+_LONE_LITERAL = re.compile(r"(['\"])(?:\\.|(?!\1)[^\\\n])*\1")
+
+
+def _top_level_ops(text: str, start: int, end: int) -> list[tuple[int, int, str]] | None:
+    """Top-level fallback (``?:``, ``??``, ``||``, ``or``) and concatenation
+    (``.``) operators in ``text[start:end]``. None when quotes do not balance."""
+    ops: list[tuple[int, int, str]] = []
+    depth, i = 0, start
+    while i < end:
+        c = text[i]
+        if c in "'\"":
+            j = i + 1
+            while j < end and text[j] != c:
+                j += 2 if text[j] == "\\" else 1
+            if j >= end:
+                return None
+            i = j + 1
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0:
+            two = text[i:i + 2]
+            if two in ("??", "?:", "||"):
+                ops.append((i, i + 2, two))
+                i += 2
+                continue
+            if c == "." and text[i + 1:i + 2] not in ("=", ".") and text[i - 1:i] != ".":
+                ops.append((i, i + 1, "."))
+            elif c.lower() == "o" and text[i:i + 2].lower() == "or" and not (text[i - 1:i].isalnum() or text[i - 1:i] in "_$") \
+                    and not (text[i + 2:i + 3].isalnum() or text[i + 2:i + 3] == "_"):
+                ops.append((i, i + 2, "or"))
+                i += 2
+                continue
+        i += 1
+    return ops
+
+
+def _lone_literal(text: str, start: int, end: int) -> tuple[int, int] | None:
+    """Content span of a single non-interpolated string literal filling ``text[start:end]``
+    (surrounding whitespace and parentheses allowed)."""
+    while start < end and (text[start].isspace() or text[start] == "("):
+        start += 1
+    while end > start and (text[end - 1].isspace() or text[end - 1] == ")"):
+        end -= 1
+    m = _LONE_LITERAL.fullmatch(text, start, end)
+    if not m or (text[start] == '"' and "$" in text[start + 1:end - 1]):
+        return None
+    return start + 1, end - 1
+
+
+def fold_literal(text: str, start: int, end: int) -> tuple[str, int, int] | None:
+    """Constant value of an expression in ``text[start:end]``:
+
+    * ``getenv('X') ?: 'v'`` / ``$a ?? 'v'`` / ``x || 'v'`` / ``x or 'v'``: the
+      fallback literal (exact span);
+    * ``'a' . 'b' . 'c'``: the span from the first literal's content to the last
+      one's, so replacing it yields one literal (``'${AI_SAFE_SECRET_X}'``).
+    """
+    ops = _top_level_ops(text, start, end)
+    if not ops:
+        return None
+    fallbacks = [o for o in ops if o[2] != "."]
+    if fallbacks:
+        tail_start = fallbacks[-1][1]
+        if any(o[0] >= tail_start for o in ops):
+            return None
+        span = _lone_literal(text, tail_start, end)
+        return (text[span[0]:span[1]], *span) if span else None
+    bounds = [start] + [b for o in ops for b in (o[0], o[1])] + [end]
+    parts = [_lone_literal(text, bounds[i], bounds[i + 1]) for i in range(0, len(bounds), 2)]
+    if len(parts) < 2 or any(p is None for p in parts):
+        return None
+    s0, e1 = parts[0][0], parts[-1][1]
+    return text[s0:e1], s0, e1
+
+
 def _classify(text: str, start: int, end: int, literals: list[tuple[str, int, int]]) -> Arg:
     raw = text[start:end]
     seg = raw.strip()
     if not seg:
         return Arg("empty")
     seg_start = start + (len(raw) - len(raw.lstrip()))
+    if len(literals) >= 1 and (folded := fold_literal(text, start, end)):
+        return Arg("str", *folded)
     if len(literals) == 1:
         q, s, e = literals[0]
         if seg == text[s - 1:e + 1]:

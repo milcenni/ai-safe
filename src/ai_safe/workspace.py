@@ -10,6 +10,7 @@ Layout::
         credential-map.json          placeholder metadata (never secrets)
         credential-secrets.enc       optional, encrypted
         snapshot/                    pristine copy of the sanitized workspace
+        integrated/                  review baseline of files integrated since (partial integration)
         reports/                     scan/verify/review/integration reports
         patches/                     redacted record of integrated patches
 
@@ -33,7 +34,7 @@ import os
 import secrets
 import shutil
 import stat
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from importlib import resources
 from pathlib import Path
 
@@ -107,6 +108,11 @@ class Session:
     verified_tree_hash: str | None = None
     integrated_tree_hash: str | None = None  # reviewed workspace tree after a full (no --exclude) integration; None if it changed during approval
     history_only_secrets: int = 0
+    # Files integrated since the snapshot was taken (partial integration): repo-relative path ->
+    # keyed digest (HMAC-SHA256, repo salt) of the bytes written to the original, or "deleted".
+    # The workspace bytes that were integrated are kept in ``integrated_dir`` as the new review
+    # baseline for that path. Cleared by resync (the new snapshot contains them).
+    integrated_files: dict[str, str] = field(default_factory=dict)
 
     @property
     def repo_path(self) -> Path:
@@ -123,6 +129,11 @@ class Session:
     @property
     def snapshot_dir(self) -> Path:
         return self.state_path / "snapshot"
+
+    @property
+    def integrated_dir(self) -> Path:
+        """Review baseline for integrated files (sanitized workspace bytes, like the snapshot)."""
+        return self.state_path / "integrated"
 
     @property
     def manifest_path(self) -> Path:

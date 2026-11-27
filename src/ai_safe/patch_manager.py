@@ -72,8 +72,11 @@ class FileChange:
 
 
 def collect_changes(snapshot: Path, workspace: Path) -> list[FileChange]:
-    a = tree_index(snapshot)
-    b = tree_index(workspace)
+    return diff_index(tree_index(snapshot), tree_index(workspace))
+
+
+def diff_index(a: dict[str, EntryInfo], b: dict[str, EntryInfo]) -> list[FileChange]:
+    """Changes from index ``a`` (baseline) to index ``b`` (workspace)."""
     changes: list[FileChange] = []
     for path in sorted(set(a) | set(b)):
         old, new = a.get(path), b.get(path)
@@ -88,6 +91,48 @@ def collect_changes(snapshot: Path, workspace: Path) -> list[FileChange]:
         elif old.kind == "file" and (old.mode & 0o111) != (new.mode & 0o111):
             changes.append(FileChange(path, "mode_changed", old, new))
     return changes
+
+
+_RENAME_SIMILARITY = 0.5  # like Git's default rename threshold
+_RENAME_MAX_PAIRS = 2500  # bound the similarity search (best effort)
+_RENAME_MAX_BYTES = 256 * 1024
+
+
+def detect_renames(changes: list[FileChange]) -> list[tuple[str, str]]:
+    """Pairs ``(deleted path, added path)`` that look like a rename: identical content
+    first, then text files at least 50 % similar. One-to-one, best effort."""
+    deleted = [c for c in changes if c.kind == "deleted" and c.old and c.old.kind == "file" and c.old.data is not None]
+    added = [c for c in changes if c.kind == "added" and c.new and c.new.kind == "file" and c.new.data is not None]
+    pairs: list[tuple[str, str]] = []
+    used_new: set[str] = set()
+    rest: list[FileChange] = []
+    for d in deleted:
+        same = next((a for a in added if a.path not in used_new and a.new.sha256 == d.old.sha256), None)
+        if same is None:
+            rest.append(d)
+            continue
+        pairs.append((d.path, same.path))
+        used_new.add(same.path)
+    candidates = [a for a in added if a.path not in used_new]
+    if rest and candidates and len(rest) * len(candidates) <= _RENAME_MAX_PAIRS:
+        scored: list[tuple[float, str, str]] = []
+        for d in rest:
+            for a in candidates:
+                if max(d.old.size, a.new.size) > _RENAME_MAX_BYTES or is_binary(d.old.data) or is_binary(a.new.data):
+                    continue
+                sm = difflib.SequenceMatcher(None, d.old.data.splitlines(), a.new.data.splitlines(), autojunk=False)
+                if sm.real_quick_ratio() < _RENAME_SIMILARITY or sm.quick_ratio() < _RENAME_SIMILARITY:
+                    continue
+                ratio = sm.ratio()
+                if ratio >= _RENAME_SIMILARITY:
+                    scored.append((ratio, d.path, a.path))
+        used_old: set[str] = set()
+        for _ratio, old, new in sorted(scored, key=lambda t: (-t[0], t[1], t[2])):
+            if old not in used_old and new not in used_new:
+                pairs.append((old, new))
+                used_old.add(old)
+                used_new.add(new)
+    return sorted(pairs)
 
 
 @dataclass

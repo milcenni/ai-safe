@@ -25,9 +25,17 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 
 PLACEHOLDER_PREFIX = "AI_SAFE_SECRET_"
+# Infrastructure placeholders (restorable on integration): kind -> prefix
+INFRA_PREFIXES = {
+    "host": "AI_SAFE_HOST_", "domain": "AI_SAFE_DOMAIN_", "ip": "AI_SAFE_IP_", "net": "AI_SAFE_NET_",
+    "bucket": "AI_SAFE_BUCKET_", "account": "AI_SAFE_ACCOUNT_", "project": "AI_SAFE_PROJECT_",
+}
+_KINDS = "SECRET|HOST|DOMAIN|IP|NET|BUCKET|ACCOUNT|PROJECT"
 PLACEHOLDER_RE = re.compile(r"\$\{AI_SAFE_SECRET_[A-Z0-9_]+\}")
-PLACEHOLDER_NAME_RE = re.compile(r"AI_SAFE_SECRET_[A-Z0-9_]+")
-_PLACEHOLDER_VALUE_RE = re.compile(r"\$?\{?AI_SAFE_SECRET_[A-Z0-9_]+\}?")
+ANY_PLACEHOLDER_RE = re.compile(r"\$\{AI_SAFE_(?:" + _KINDS + r")_[A-Z0-9_]+\}")
+INFRA_PLACEHOLDER_RE = re.compile(r"\$\{(?P<name>AI_SAFE_(?:HOST|DOMAIN|IP|NET|BUCKET|ACCOUNT|PROJECT)_[A-Z0-9_]+)\}")
+PLACEHOLDER_NAME_RE = re.compile(r"AI_SAFE_(?:" + _KINDS + r")_[A-Z0-9_]+")
+_PLACEHOLDER_VALUE_RE = re.compile(r"\$?\{?AI_SAFE_(?:" + _KINDS + r")_[A-Z0-9_]+\}?")
 
 MARKER_FILE = ".ai-safe-workspace.json"
 WORKSPACE_PREFIX = "ai-safe-ws-"

@@ -63,6 +63,23 @@ Before doing anything else:
   into new code and never replace a placeholder with a literal value.
 - For tests, use obviously synthetic values generated at runtime or test fixtures that
   are clearly fake and not credential-shaped.
+- `${...}` is also interpolation syntax in `docker-compose.yml`, `.env`-style files and shell
+  scripts. A placeholder there is not a variable to define: never "fix" such a line by adding
+  the variable, a default value or an `.env` entry.
+
+## 3a. Infrastructure, user name and identifier placeholders
+
+- `${AI_SAFE_HOST_...}`, `${AI_SAFE_DOMAIN_...}`, `${AI_SAFE_IP_...}`, `${AI_SAFE_NET_...}`,
+  `${AI_SAFE_BUCKET_...}`, `${AI_SAFE_ACCOUNT_...}` and `${AI_SAFE_PROJECT_...}` stand for real
+  internal host names, domains, IP addresses, buckets and cloud accounts. Text around them
+  (scheme, port, path, a provider suffix such as `.rds.amazonaws.com`) is real.
+- You may reference an existing infrastructure placeholder where the same host is meant.
+  Never invent a new one, never try to resolve or guess it, and in new code read hosts from
+  configuration or environment variables instead of hardcoding them.
+- If the project uses pseudonyms instead (`h-1a2b3c.d-4d5e6f.invalid`, `198.18.x.x`,
+  `2001:db8:...`), the same rules apply: reuse, never invent.
+- User names next to credentials and account / tenant / client IDs may also be replaced by
+  `${AI_SAFE_SECRET_...}` placeholders. Treat them like credentials: never guess them.
 
 ## 4. Missing configuration
 

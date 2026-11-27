@@ -14,6 +14,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from ai_safe.classifier import DEFAULT_IDENTIFIER_KEYS
 from ai_safe.models import Category
 
 CONFIG_FILENAME = "ai-safe.yaml"
@@ -156,6 +157,54 @@ class PlaceholderConfig(_Strict):
     deterministic: bool = True
 
 
+class UsernameConfig(_Strict):
+    # A user name next to a detected password / secret / token is replaced too.
+    enabled: bool = True
+    # Generic names (root, admin, postgres, sa, ...) reveal nothing: kept unless true.
+    include_default_usernames: bool = False
+
+
+class IdentifierConfig(_Strict):
+    # Account / tenant / client IDs, publishable keys, phone numbers: not
+    # credentials, but they identify the organisation's accounts.
+    enabled: bool = True
+    keys: list[str] = Field(default_factory=lambda: list(DEFAULT_IDENTIFIER_KEYS))
+
+    @field_validator("keys")
+    @classmethod
+    def _keys(cls, v: list[str]) -> list[str]:
+        for k in v:
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.\-]{0,63}", k):
+                raise ValueError(f"invalid identifier key: {k!r}")
+        return v
+
+
+class InfrastructureConfig(_Strict):
+    # Internal host names, domains, IP addresses, buckets and cloud account IDs
+    # are replaced by ${AI_SAFE_HOST_...}-style placeholders (restorable).
+    enabled: bool = True
+    mode: Literal["placeholder", "pseudonym"] = "placeholder"
+    scope: Literal["host", "domain"] = "host"
+    hostnames: bool = True
+    ip_addresses: Literal["none", "private", "all"] = "private"
+    org_domains: list[str] = Field(default_factory=list)
+    keep_domains: list[str] = Field(default_factory=list)
+    buckets: bool = True
+    cloud_resource_ids: bool = True
+    restore_on_integrate: bool = True
+
+    @field_validator("org_domains", "keep_domains")
+    @classmethod
+    def _domains(cls, v: list[str]) -> list[str]:
+        out = []
+        for d in v:
+            d = d.strip().lower().lstrip(".").rstrip(".")
+            if not re.fullmatch(r"[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?)*", d):
+                raise ValueError(f"invalid domain: {d!r}")
+            out.append(d)
+        return out
+
+
 class SanitizationConfig(_Strict):
     exclude: list[str] = Field(default_factory=lambda: list(DEFAULT_EXCLUDES))
     include_ignored_files: bool = False
@@ -166,6 +215,9 @@ class SanitizationConfig(_Strict):
     placeholders: PlaceholderConfig = Field(default_factory=PlaceholderConfig)
     # Email addresses (internal staff, customers) are personal data: replaced by default.
     sanitize_emails: bool = True
+    usernames: UsernameConfig = Field(default_factory=UsernameConfig)
+    identifiers: IdentifierConfig = Field(default_factory=IdentifierConfig)
+    infrastructure: InfrastructureConfig = Field(default_factory=InfrastructureConfig)
 
     @field_validator("exclude")
     @classmethod
@@ -384,6 +436,23 @@ sanitization:
   include_ignored_files: false
   history_summary: false
   sanitize_emails: true      # false = email addresses are not detected or replaced
+  usernames:                 # user names next to a detected password / secret / token
+    enabled: true
+    include_default_usernames: false   # true = also root, admin, postgres, sa, ...
+  identifiers:               # client / tenant / account IDs, publishable keys, phone numbers
+    enabled: true
+    # keys: [client_id, tenant_id, account_sid, ...]   # default list: see README
+  infrastructure:            # internal hosts, domains, IPs, buckets -> ${AI_SAFE_HOST_...} (restored on integrate)
+    enabled: true
+    mode: placeholder        # placeholder | pseudonym
+    scope: host              # host: whole FQDN | domain: only the organisation domain
+    hostnames: true
+    ip_addresses: private    # none | private | all
+    org_domains: []          # always sanitize these suffixes, e.g. [company.net, corp.internal]
+    keep_domains: []         # never sanitize (on top of the builtin public allow-list)
+    buckets: true
+    cloud_resource_ids: true
+    restore_on_integrate: true
   placeholders:
     enabled: true
     deterministic: true

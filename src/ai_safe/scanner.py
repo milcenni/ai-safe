@@ -24,11 +24,12 @@ from ai_safe import git_history as gh
 from ai_safe import php_ast
 from ai_safe.classifier import ClaudePath, categorize, claude_path_policy, is_pristine_ai_safe_skill
 from ai_safe.config import AISafeConfig
-from ai_safe.detectors import BuiltinDetector, key_before
+from ai_safe.detectors import BuiltinDetector, accept_engine_finding, key_before
 from ai_safe.gitleaks import Gitleaks, load_report
-from ai_safe.models import Category, Finding, Location
+from ai_safe.infra import detect_infra
+from ai_safe.models import INFRA_KIND_CATEGORY, Category, Finding, Location
 from ai_safe.php_dataflow import trace_php
-from ai_safe.security import REDACTOR, hmac_fingerprint, is_binary, is_placeholder_value
+from ai_safe.security import PLACEHOLDER_NAME_RE, REDACTOR, hmac_fingerprint, is_binary, is_placeholder_value
 
 
 @dataclass
@@ -85,7 +86,9 @@ class Scanner:
         self.cfg = cfg
         self.salt = salt
         self.detector = BuiltinDetector(cfg.scanner.custom_rules, enable_builtin=cfg.scanner.builtin_rules,
-                                        emails=cfg.sanitization.sanitize_emails)
+                                        emails=cfg.sanitization.sanitize_emails,
+                                        usernames=cfg.sanitization.usernames,
+                                        identifiers=cfg.sanitization.identifiers)
         if gitleaks is None and cfg.scanner.engine == "gitleaks":
             gitleaks = Gitleaks.require(cfg.scanner.gitleaks_path, cfg.scanner.timeout_seconds)
         self.gitleaks = gitleaks
@@ -98,12 +101,14 @@ class Scanner:
     # ------------------------------------------------------------------
 
     def _finding(self, *, rule_id, category, file, line, end_line, engine, location, key=None,
-                 commit=None, exact=True, secret="") -> Finding:
-        REDACTOR.add(secret)
+                 commit=None, exact=True, secret="", kind=None) -> Finding:
+        if kind is None:
+            REDACTOR.add(secret)  # host names are not credentials: logs may name them
+        ident = secret.lower().rstrip(".") if kind in ("host", "domain") else secret
         return Finding(
             rule_id=rule_id, category=category, file=file, line=line, end_line=end_line,
             engine=engine, location=location, key=key, commit=commit, exact=exact, secret=secret,
-            fingerprint=hmac_fingerprint(secret, self.salt) if secret else "",
+            fingerprint=hmac_fingerprint(ident, self.salt) if secret else "", kind=kind,
         )
 
     def detect_text(self, text: str, rel: str, location: Location, *, line_offset: int = 0,
@@ -126,7 +131,7 @@ class Scanner:
 
     def from_gitleaks(self, rec: dict, location: Location, text_by_file: dict[str, str] | None = None) -> Finding | None:
         secret = str(rec.get("Secret") or "")
-        if not secret or is_placeholder_value(secret) or "AI_SAFE_SECRET_" in secret:
+        if not secret or is_placeholder_value(secret) or PLACEHOLDER_NAME_RE.search(secret):
             return None
         file = str(rec.get("File", ""))
         line = int(rec.get("StartLine") or 1)
@@ -144,6 +149,8 @@ class Scanner:
             if idx > 0:
                 key = key_before(match, idx)
         rule = str(rec.get("RuleID", "gitleaks"))
+        if not accept_engine_finding(rule, secret, key, file):
+            return None
         return self._finding(
             rule_id=rule, category=categorize(rule, key, secret, file), file=file, line=line,
             end_line=end_line, engine="gitleaks", location=location, key=key,
@@ -260,10 +267,20 @@ class Scanner:
             flow, flow_warnings = trace_php(texts, ast=self.php_ast)
             for ff in flow:
                 findings.append(self._finding(
-                    rule_id=ff.rule_id, category=ff.category, file=ff.file, line=ff.line, end_line=ff.line,
+                    rule_id=ff.rule_id, category=Category.USERNAME if ff.role == "user" else ff.category,
+                    file=ff.file, line=ff.line, end_line=ff.line,
                     engine="builtin", location=files[ff.file], key=ff.key, secret=ff.secret,
                 ))
             result.warnings.extend(str(w) for w in flow_warnings)
+
+        # 1c. Infrastructure: internal hosts, domains, IPs, buckets, cloud IDs (restorable placeholders)
+        infra_cfg = self.cfg.sanitization.infrastructure
+        if infra_cfg.enabled:
+            for h in detect_infra(texts, infra_cfg):
+                findings.append(self._finding(
+                    rule_id=f"infra-{h.kind}", category=INFRA_KIND_CATEGORY[h.kind], file=h.file, line=h.line,
+                    end_line=h.line, engine="builtin", location=files[h.file], key=h.key, secret=h.value, kind=h.kind,
+                ))
 
         if self.gitleaks:
             for rec in self.gitleaks.scan_dir(root):
@@ -323,7 +340,31 @@ class Scanner:
                     findings.append(f)
 
         result.findings = dedupe_findings(findings)
+        result.warnings.extend(credential_reuse(result.findings))
         return result
+
+
+def credential_reuse(findings: list[Finding]) -> list[str]:
+    """One credential value used under unrelated keys (a real security smell).
+    Reported by key names and files only, never by value."""
+    from ai_safe.models import INFRA_CATEGORIES, NON_PROPAGATING_CATEGORIES, WORKING_TREE_LOCATIONS
+    from ai_safe.classifier import key_words
+
+    uses: dict[str, dict[tuple[str, int], set[str]]] = {}
+    for f in findings:
+        if f.location not in WORKING_TREE_LOCATIONS or not f.key or not f.fingerprint:
+            continue
+        if f.category in NON_PROPAGATING_CATEGORIES or f.category in INFRA_CATEGORIES:
+            continue
+        uses.setdefault(f.fingerprint, {}).setdefault((f.file, f.line), set()).add("_".join(key_words(f.key)))
+    out = []
+    for locs in uses.values():
+        sets = list(locs.values())
+        if any(not (a & b) for i, a in enumerate(sets) for b in sets[i + 1:]):
+            keys = sorted(set().union(*sets))
+            files = sorted({file for file, _ in locs})
+            out.append(f"credential reuse: one value is used under keys {', '.join(keys)} (files: {', '.join(files[:10])})")
+    return sorted(out)
 
 
 def dedupe_findings(findings: list[Finding]) -> list[Finding]:
@@ -337,6 +378,8 @@ def dedupe_findings(findings: list[Finding]) -> list[Finding]:
                 prev.engine = prev.engine + "+" + f.engine
             if prev.category == Category.GENERIC_SECRET and f.category != Category.GENERIC_SECRET:
                 prev.category = f.category
+            if f.kind and not prev.kind and prev.category in (Category.IDENTIFIER, Category.GENERIC_SECRET):
+                prev.kind, prev.category, prev.rule_id = f.kind, f.category, f.rule_id  # cloud IDs: restorable
             if prev.key is None and f.key:
                 prev.key = f.key
             prev.exact = prev.exact and f.exact

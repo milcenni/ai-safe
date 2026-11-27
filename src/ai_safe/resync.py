@@ -16,8 +16,8 @@ from pathlib import Path
 
 from ai_safe.config import AISafeConfig
 from ai_safe.credential_map import CredentialMap
-from ai_safe.patch_manager import FileChange, collect_changes
-from ai_safe.review import is_tool_metadata
+from ai_safe.patch_manager import FileChange
+from ai_safe.review import is_tool_metadata, workspace_changes
 from ai_safe.sanitizer import Sanitizer
 from ai_safe.scanner import Scanner
 from ai_safe.security import (
@@ -41,7 +41,7 @@ from ai_safe.workspace import (
 )
 
 PENDING_REASON = "workspace has changes not integrated - run ai-safe integrate, or resync --discard"
-STATE_ITEMS = ("manifest.json", "credential-map.json", "credential-secrets.enc", "snapshot")
+STATE_ITEMS = ("manifest.json", "credential-map.json", "credential-secrets.enc", "infra-map.json", "snapshot")
 
 
 @dataclass
@@ -52,14 +52,16 @@ class ResyncResult:
 
 
 def pending_changes(session: Session) -> list[FileChange]:
-    """Workspace changes since the snapshot, or ``[]`` when the workspace is exactly
-    what the developer last integrated in full. Changes that review always skips as
-    tool metadata (generated files, ai-safe skills, ``.claude/settings*.json``, other
-    ``.claude/`` paths) are never integrated, so they do not count."""
+    """Workspace changes that were not integrated, or ``[]`` when the workspace is exactly
+    what the developer last integrated in full. Files integrated since the snapshot
+    (``Session.integrated_files``) count only if the AI changed them again afterwards.
+    Changes that review always skips as tool metadata (generated files, ai-safe skills,
+    ``.claude/settings*.json``, other ``.claude/`` paths) are never integrated, so they
+    do not count."""
     ws = session.workspace_path
     if session.integrated_tree_hash and tree_hash(ws) == session.integrated_tree_hash:
         return []
-    return [c for c in collect_changes(session.snapshot_dir, ws) if not is_tool_metadata(c.path)]
+    return [c for c in workspace_changes(session) if not is_tool_metadata(c.path)]
 
 
 def _check_workspace(session: Session, store: SessionStore) -> Path:
@@ -168,9 +170,10 @@ def resync(
 
         # Fail closed across crashes: while state and workspace are being swapped the
         # session is "resyncing" with no verified hash, so open/integrate refuse it.
-        # The old values come back only after a complete rollback.
-        prev = (session.status, session.verified_tree_hash)
-        session.status, session.verified_tree_hash = "resyncing", None
+        # The old values come back only after a complete rollback. Integrated-file records
+        # are dropped too: against an old snapshot that makes them pending again (fail closed).
+        prev = (session.status, session.verified_tree_hash, dict(session.integrated_files))
+        session.status, session.verified_tree_hash, session.integrated_files = "resyncing", None, {}
         session.save()
         try:
             done = _swap_state(session.state_path, stage_state)
@@ -178,7 +181,7 @@ def resync(
             keep_state = True
             raise
         except BaseException:
-            session.status, session.verified_tree_hash = prev
+            session.status, session.verified_tree_hash, session.integrated_files = prev
             session.save()
             raise
         try:
@@ -190,7 +193,7 @@ def resync(
                 keep_state = True
                 raise
             if not isinstance(exc, IncompleteRollbackError):
-                session.status, session.verified_tree_hash = prev
+                session.status, session.verified_tree_hash, session.integrated_files = prev
                 session.save()
             raise
         session.status = "verified"
@@ -198,6 +201,7 @@ def resync(
         session.integrated_tree_hash = None
         session.history_only_secrets = staging.history_only_secrets
         session.save()
+        secure_remove_tree(session.integrated_dir)  # the new snapshot contains the integrated files
         return ResyncResult(True, None, vr)
     finally:
         if stage_ws is not None:

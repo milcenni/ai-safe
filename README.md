@@ -78,7 +78,7 @@ compares against your updated repository.
 | Open | `ai-safe open` | Menu to open the verified workspace in an AI agent CLI, VSCode or a Docker container, or to print the commands. Launches only on your menu choice and only with `security.allow_ai_launch: true`. |
 | Resync | `ai-safe resync` | Rebuild the workspace from the current repository in place (same path), verified in a staging directory before anything reaches the live workspace. |
 | Review | `ai-safe review` | Diff of the workspace against a pristine snapshot kept outside it. Flags hardcoded credentials, placeholder misuse, sensitive-file and `.gitignore` changes, symlinks and hard links, files in ignored paths, hidden control characters, and conflicts. |
-| Integrate | `ai-safe integrate` | Applies the reviewed changes to the original repository after path validation, a final scan and your typed approval. Credentials are preserved. Nothing is committed or pushed. |
+| Integrate | `ai-safe integrate` | Applies the reviewed changes to the original repository after path validation, a final scan and your typed approval. Credentials are preserved. Nothing is committed or pushed. `--only PATH` or `--select` integrates just the files you choose; the rest stay in the workspace. |
 | Cleanup | `ai-safe cleanup` | Securely deletes workspaces, snapshots and mappings. |
 
 Credential categories: `API_KEY`, `ACCESS_TOKEN`, `PASSWORD`, `DATABASE_CREDENTIAL`, `PRIVATE_KEY`,
@@ -297,6 +297,10 @@ ai-safe review
 
 # Integrate approved changes
 ai-safe integrate
+
+# Integrate only some files (the rest stay in the workspace)
+ai-safe integrate --only src/a.php --only src/lib/
+ai-safe integrate --select
 ```
 
 | Command | Main options | Exit codes |
@@ -308,7 +312,7 @@ ai-safe integrate
 | `ai-safe open` | `--session ID`, `-c ai-safe.yaml` | 0 launched or printed · 1 workspace unverified or missing · 2 no TTY, no valid choice, or Docker image not set · 3 refused inside an AI agent session, or the launch failed |
 | `ai-safe resync` | `--session ID`, `-c ai-safe.yaml`, `--discard` (also asks you to type `discard`) | 0 resynced · 1 pending changes, verification failed or not confirmed · 3 refused inside an AI agent session |
 | `ai-safe review` | `--session ID`, `-o report.json` | 0 pass · 1 blocking issues |
-| `ai-safe integrate` | `--dry-run`, `--exclude PATH` (repeatable), `--session ID` | 0 applied/dry run · 1 refused |
+| `ai-safe integrate` | `--dry-run`, `--only PATH` (repeatable: file, directory or glob), `--select` (interactive picker), `--exclude PATH` (repeatable, wins over `--only`), `--session ID` | 0 applied, dry run or nothing selected · 1 refused · 2 `--only` matched no changed file, `--only` with `--select`, or `--select` without a terminal · 3 refused inside an AI agent session |
 | `ai-safe cleanup` | `--session ID`, `--all`, `--yes` | 0 |
 | `ai-safe sessions` | | 0 |
 | `ai-safe mapping show` | `--env-template` | 0 |
@@ -343,6 +347,27 @@ still counts as pending. Changes to tool metadata that is never integrated (ai-s
 skills, `.claude/settings*.json`, other `.claude/` paths) do not count. Otherwise integrate first, or pass
 `--discard` and type `discard` to throw the changes away. After `ai-safe integrate`, run `ai-safe resync`
 before the AI continues working. It refuses inside an AI agent session.
+
+**Partial integration.** `ai-safe integrate --only PATH` (repeatable) integrates only the changed files
+that match: an exact file, a directory prefix (`src/lib/`) or a glob matched against the repo-relative
+path (`'app/Controllers/*.php'`; `*` stays within one directory, `**` spans directories). A pattern that
+matches no changed file is an error, so a typo never looks like a successful run. `--exclude` still wins
+over `--only`. `ai-safe integrate --select` lists every change after review and asks which rows to
+integrate (`1,3-5`, `all` or `none`); rows review never integrates (binary or mode-only changes, tool
+metadata) are shown but cannot be chosen, and it refuses without an interactive terminal. Both then show
+the patch for the selected files only and ask for the typed `apply`. Review still runs on every change:
+an error in a file you did not select is reported but does not block, because that file is not written.
+Changes to ai-safe itself (the workspace marker, `.ai-safe/`, `.claude/ai-safe/`, security tooling
+configuration) and an original credential value in AI output (`known-secret`) block whatever you select.
+A rename is integrated as a pair, and ai-safe warns (without selecting anything) when a selected file
+`require`s, `include`s, `use`s or `import`s a file the AI added that you did not select. The patch record
+and `integration.json` list the selected files and the ones left in the workspace.
+
+ai-safe remembers what it integrated. A later `ai-safe integrate` does not show those files again and does
+not report them as `original-changed`; if the AI changes one again, review compares it against what was
+integrated. `ai-safe resync` ignores integrated files: it still refuses while other changes are pending,
+and runs without `--discard` once everything is integrated. `ai-safe resync --discard` tells you how many
+changes it throws away (the ones that were not integrated).
 
 `verify`, `review` and `mapping` find their session automatically, either from the workspace marker (when
 run inside a workspace) or from the latest session for the current repository.
@@ -419,6 +444,23 @@ sanitization:
   allowed_binary_extensions: [.png, .jpg, .gif, .ico, .woff2]
   history_summary: false
   sanitize_emails: true       # false = email addresses are not detected or replaced
+  usernames:                  # user names next to a detected password / secret / token
+    enabled: true
+    include_default_usernames: false   # true = also root, admin, postgres, sa, ...
+  identifiers:                # client / tenant / account IDs, publishable keys, Twilio SIDs, phone numbers
+    enabled: true
+    # keys: [client_id, app_id, tenant_id, subscription_id, account_sid, merchant_id, project_id, ...]
+  infrastructure:             # internal hosts, domains, IPs, buckets -> ${AI_SAFE_HOST_...} (restored on integrate)
+    enabled: true
+    mode: placeholder         # placeholder | pseudonym (valid, non-resolving stand-ins)
+    scope: host               # host: whole FQDN | domain: only the organisation domain
+    hostnames: true
+    ip_addresses: private     # none | private | all
+    org_domains: []           # always sanitize these suffixes, e.g. [corp-x.net, corp.internal]
+    keep_domains: []          # never sanitize (on top of the built-in public allow-list)
+    buckets: true
+    cloud_resource_ids: true  # ARN account IDs, GCP project IDs
+    restore_on_integrate: true
   placeholders:
     enabled: true             # false = files with secrets are excluded instead of redacted
     deterministic: true
@@ -508,8 +550,13 @@ passphrase for encrypted values. `AI_SAFE_DEBUG=1` shows tracebacks.
 4. **Redact.** The redaction engine is separate from detection:
    - Every finding must have an exact span. A private key with no END line, for example, cannot be bounded,
      so the file is excluded.
-   - Every occurrence of a detected value is replaced: in the same file for values of 6 or more characters,
-     and in all files for values of 8 or more characters, including values seen only in history.
+   - The detected occurrence is replaced, and the value is *propagated*: replaced wherever else it occurs
+     (in the same file for values of 6 or more characters, in all files for 8 or more, including values
+     seen only in history), but only on token boundaries. When a known secret sits inside a longer token
+     (`base64:<secret><more>=`), the whole token is a secret too: it is registered and replaced as one
+     placeholder, and format prefixes such as `base64:`, `$2y$10$` or `Bearer ` stay readable. Low-entropy
+     values are replaced only as whole tokens; user names, emails and identifiers are never propagated,
+     so `prod_appsvc01` is not rewritten because `appsvc01` is a user name.
    - Overlapping spans are merged.
    - The rewritten text is scanned again. Any residual detection, or any detected value still present,
      excludes the file.
@@ -523,6 +570,32 @@ passphrase for encrypted values. `AI_SAFE_DEBUG=1` shows tracebacks.
    Sanitized: OPENAI_API_KEY=${AI_SAFE_SECRET_OPENAI_API_KEY}  DB_PASSWORD=${AI_SAFE_SECRET_DB_PASSWORD}
    ```
 
+   A value used under unrelated keys (the same token as `twilio.auth_token` and `datadog.api_key`) is named
+   `${AI_SAFE_SECRET_SHARED_<CATEGORY>_<fp>}`; `AI_SAFE_PLACEHOLDERS.md` lists its keys under "Also used
+   as", and the scan reports the reuse (key names and files only). User names next to a credential and
+   account identifiers get their own tables in `AI_SAFE_PLACEHOLDERS.md`.
+
+   **Infrastructure.** Internal host names, domains, private IP addresses, buckets and cloud account /
+   project IDs get separate, restorable placeholders. Only the host part is replaced; scheme, port, path
+   and a provider suffix stay:
+
+   ```
+   'hostname' => 'db-prod-01.internal.corp-x.net'   ->  'hostname' => '${AI_SAFE_HOST_9B41D0}'
+   'hostname' => 'pg-main.rds.amazonaws.com'        ->  'hostname' => '${AI_SAFE_HOST_18F0A3}.rds.amazonaws.com'
+   'cluster_url' => 'https://k8s.corp-x.net:6443'   ->  'cluster_url' => 'https://${AI_SAFE_HOST_CLUSTER_URL}:6443'
+   $host = '192.168.50.100';                        ->  $host = '${AI_SAFE_IP_A07B2E}';
+   'user'@'10.0.0.%'                                ->  'user'@'${AI_SAFE_NET_6F3A90}.%'
+   'host' => 'smtp.sendgrid.net'                    ->  unchanged (public service)
+   ```
+
+   Hosts are detected in string literals, comments and config values only, never in code identifiers.
+   A value under a host-like key, a URL, a DSN (`host=`, `Server=`), `-h`, an SQL grant, an internal
+   pseudo-TLD (`.internal`, `.corp`, `.local`, ...) or an `org_domains` suffix is replaced; any other FQDN is
+   replaced only when its domain is one of those (or an email domain), so dotted config keys like
+   `'app.name'` stay. Public services, loopback addresses, reserved names, file names and versions are kept.
+   The same host gets the same placeholder everywhere. Integration writes the original host back
+   (`restore_on_integrate`); `AI_SAFE_SECRET_*` placeholders are never restored.
+
 6. **Final sweep.** Every written file is re-read, and any file that still contains a known value is
    removed.
 7. **Permissions.** Owner bits are kept; setuid, setgid, sticky and group/other write bits are stripped.
@@ -532,8 +605,13 @@ passphrase for encrypted values. `AI_SAFE_DEBUG=1` shows tracebacks.
      the original.
    - `credential-map.json`: placeholder, category, fingerprint, key and files.
    - Both are mode 0600, stored outside the workspace, and contain no values.
+   - `infra-map.json`: infrastructure placeholder, kind and the original host name / address (needed to
+     restore it on integration; mode 0600, outside the workspace, never credentials).
 9. **Snapshot and verify.** A pristine copy is stored in the state directory, then the verifier runs. Only
-   a passing workspace is offered to the AI.
+   a passing workspace is offered to the AI. Besides the detectors, verify checks the *result*: a
+   placeholder glued to other token characters (`${…}tail`, `prod_${…}`), a URL whose password is not
+   exactly one placeholder, provider token prefixes without any gate, high-entropy literals (warning),
+   leftover internal hosts (warning), and whether Gitleaks ran.
 
 ---
 
@@ -598,6 +676,9 @@ passphrase for encrypted values. `AI_SAFE_DEBUG=1` shows tracebacks.
   - Hunks that would require writing a real credential into an AI-modified line are rejected as conflicts.
     Apply those changes by hand.
   - Binary and mode-only changes are not integrated automatically.
+  - The dependency warning of `integrate --only/--select` is a best-effort text match (PHP
+    `require`/`include`/`use`, JS/TS `import`/`require`), not a build: check that the selected files work
+    without the ones you left in the workspace.
 - **The mapping stores fingerprints, not values,** unless you enable `store_secret_values`. Restoring
   credentials into code is intentionally not offered. Keep credentials in environment variables or a secret
   manager.
@@ -658,6 +739,7 @@ ai-safe verify && ai-safe review
 cd /tmp/ai-safe-demo
 ai-safe integrate --dry-run      # see the redacted patch
 ai-safe integrate                # type 'apply'
+#   or only part of it:  ai-safe integrate --only app/settings.py   (or --select)
 git diff                         # credentials untouched except where the AI removed a hardcoded one
 git commit -am "..."             # your decision; ai-safe never commits or pushes
 

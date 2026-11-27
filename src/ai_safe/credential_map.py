@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from ai_safe.redaction import PlaceholderRegistry
 from ai_safe.security import SecurityError, write_private_file
 
 MAP_FILE = "credential-map.json"
+INFRA_MAP_FILE = "infra-map.json"
 SECRETS_FILE = "credential-secrets.enc"
 PASSPHRASE_ENV = "AI_SAFE_MAPPING_PASSPHRASE"
 _SCRYPT_N = 2**15
@@ -39,6 +41,15 @@ class MapEntry:
     fingerprint: str
     key: str | None
     files: list[str] = field(default_factory=list)
+    propagate: str = "expand"
+    also_used_as: list[str] = field(default_factory=list)
+    kind: str | None = None
+
+    @property
+    def is_secret(self) -> bool:
+        """Credentials whose presence anywhere is a leak (not usernames,
+        emails, identifiers or infrastructure names)."""
+        return self.propagate in ("expand", "token")
 
     def public(self) -> dict:
         return {
@@ -47,6 +58,9 @@ class MapEntry:
             "fingerprint": self.fingerprint,
             "key": self.key,
             "files": self.files,
+            "propagate": self.propagate,
+            "also_used_as": self.also_used_as,
+            "kind": self.kind,
         }
 
 
@@ -59,7 +73,8 @@ class CredentialMap:
     def from_registry(cls, registry: PlaceholderRegistry) -> "CredentialMap":
         return cls(
             entries=[
-                MapEntry(e.name, e.category.value, e.fingerprint, e.key, sorted(e.files))
+                MapEntry(e.name, e.category.value, e.fingerprint, e.key, sorted(e.files), e.propagate,
+                         list(e.also_used_as), e.kind)
                 for e in registry.entries()
             ]
         )
@@ -68,7 +83,8 @@ class CredentialMap:
         return {e.placeholder for e in self.entries}
 
     def fingerprints(self) -> dict[str, str]:
-        return {e.fingerprint: e.placeholder for e in self.entries}
+        """Fingerprints of values that must never appear in the workspace."""
+        return {e.fingerprint: e.placeholder for e in self.entries if e.is_secret}
 
     def env_template(self) -> str:
         lines = ["# Placeholders used in the AI workspace. Provide real values via your",
@@ -88,7 +104,7 @@ class CredentialMap:
                 raise SecurityError(
                     f"security.store_secret_values=true requires a passphrase (set {PASSPHRASE_ENV} or enter it when prompted)"
                 )
-            values = {e.name: e.secret for e in registry.entries()}
+            values = {e.name: e.secret for e in registry.entries() if not e.restorable}
             write_private_file(state_dir / SECRETS_FILE, _encrypt(json.dumps(values).encode(), passphrase))
             self.encrypted_values = True
         doc = {
@@ -106,7 +122,8 @@ class CredentialMap:
             return cls()
         doc = json.loads(path.read_text())
         return cls(
-            entries=[MapEntry(e["placeholder"], e["category"], e["fingerprint"], e.get("key"), list(e.get("files", [])))
+            entries=[MapEntry(e["placeholder"], e["category"], e["fingerprint"], e.get("key"), list(e.get("files", [])),
+                              e.get("propagate", "expand"), list(e.get("also_used_as", [])), e.get("kind"))
                      for e in doc.get("entries", [])],
             encrypted_values=bool(doc.get("encrypted_values")),
         )
@@ -139,3 +156,43 @@ def _decrypt(blob: bytes, passphrase: str) -> bytes:
         return Fernet(_derive(passphrase, salt)).decrypt(doc["token"].encode())
     except InvalidToken:
         raise SecurityError("wrong passphrase or corrupted mapping") from None
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure map (restorable)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class InfraEntry:
+    placeholder: str
+    token: str      # text in the workspace: ${AI_SAFE_HOST_...} or a pseudonym
+    original: str   # text written back on integration
+    kind: str
+
+
+def save_infra_map(state_dir: Path, registry: PlaceholderRegistry, *, mode: str = "placeholder") -> None:
+    """Host names, IPs, buckets and cloud IDs are not credentials, so their
+    originals may be stored (mode 0600, state directory outside the workspace)
+    and written back on integration. Never used to write into the workspace."""
+    entries = [{"placeholder": e.name, "token": e.token, "original": e.original, "kind": e.kind}
+               for e in registry.entries() if e.restorable and e.files]
+    doc = {"version": 1, "mode": mode, "note": "Infrastructure names only - no credentials.", "entries": entries}
+    write_private_file(Path(state_dir) / INFRA_MAP_FILE, json.dumps(doc, indent=2))
+
+
+def load_infra_map(state_dir: Path) -> list[InfraEntry]:
+    path = Path(state_dir) / INFRA_MAP_FILE
+    if not path.is_file() or path.is_symlink():
+        return []
+    doc = json.loads(path.read_text())
+    return [InfraEntry(e["placeholder"], e["token"], e["original"], e["kind"]) for e in doc.get("entries", [])]
+
+
+def restore_infra(text: str, entries: list[InfraEntry]) -> str:
+    """Replace every infrastructure token by its original (longest token first)."""
+    if not entries or not text:
+        return text
+    by_token = {e.token: e.original for e in entries}
+    pattern = re.compile("|".join(re.escape(t) for t in sorted(by_token, key=len, reverse=True)))
+    return pattern.sub(lambda m: by_token[m.group(0)], text)

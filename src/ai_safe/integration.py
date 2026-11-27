@@ -3,7 +3,9 @@
 Order of operations (any failure aborts before the original repo is touched):
 
 1. refuse to run from inside an AI agent session or from the AI workspace;
-2. run the full review; abort on any blocking issue;
+2. run the full review on every change; with ``--only``/``--select`` restrict the
+   plan to the selected files (rename pairs atomic); abort on any blocking issue in a
+   selected file or any always-blocking issue (see ``ReviewReport.blocking_issues``);
 3. validate every target path (traversal, symlinked components, Git metadata,
    excluded/sensitive files, original unchanged since sanitization);
 4. stage the resulting files in a private temp dir and run the final
@@ -11,7 +13,9 @@ Order of operations (any failure aborts before the original repo is touched):
    in the original file appears;
 5. show a redacted patch and require explicit confirmation;
 6. apply atomically (temp file + rename), preserving original file modes;
-7. never commit, never push, never restore credentials into AI lines.
+7. never commit, never push, never restore credentials into AI lines;
+8. record what was integrated (``Session.integrated_files``) so a later integrate
+   and resync treat those files as done.
 """
 
 from __future__ import annotations
@@ -27,12 +31,13 @@ from ai_safe.config import AISafeConfig
 from ai_safe.credential_map import CredentialMap
 from ai_safe.models import Issue, Location, Severity
 from ai_safe.patch_manager import unified_diff_masked
-from ai_safe.review import PlannedChange, ReviewReport, repo_salt, review_session
+from ai_safe.review import DELETED, PlannedChange, ReviewReport, overlay_name, repo_salt, review_session
 from ai_safe.scanner import Scanner
 from ai_safe.security import (
     SecurityError,
     atomic_write,
     detect_ai_agent_env,
+    ensure_private_dir,
     hmac_fingerprint,
     is_git_metadata_path,
     is_within,
@@ -54,6 +59,12 @@ class IntegrationResult:
     review: ReviewReport | None = None
     patch_path: str | None = None
     issues: list[Issue] = field(default_factory=list)
+    selected: list[str] = field(default_factory=list)  # paths chosen for integration (all, without --only/--select)
+    left_in_workspace: list[str] = field(default_factory=list)  # changed paths not integrated by this run
+    usage_error: bool = False
+
+
+SelectFn = Callable[[ReviewReport], "set[str] | None"]
 
 
 def guard_human_context(session: Session, cwd: Path) -> None:
@@ -81,6 +92,34 @@ def build_patch(plan: list[PlannedChange], repo: Path) -> str:
         else:
             parts.append(unified_diff_masked(p.path, p.original_text or "", p.content.decode("utf-8", "replace"), p.credential_lines))
     return "".join(parts)
+
+
+def _record_header(selected: list[str], left: list[str], partial: bool) -> str:
+    def esc(p: str) -> str:
+        return repr(p)[1:-1]
+
+    lines = ["# ai-safe integration record (redacted: credential lines hidden)\n"]
+    lines.append("# selection: " + ("only the files below" if partial else "all reviewed changes") + "\n")
+    lines += [f"#   selected: {esc(p)}\n" for p in selected]
+    lines += [f"#   left in workspace: {esc(p)}\n" for p in left]
+    return "".join(lines)
+
+
+def _record_integrated(session: Session, done: list[PlannedChange], salt: bytes) -> None:
+    """Remember what was written so a later review compares these files against the
+    integrated content (not the old snapshot) and resync does not count them as pending."""
+    if not done:
+        return
+    ensure_private_dir(session.integrated_dir)
+    for p in done:
+        overlay = session.integrated_dir / overlay_name(p.path)
+        if p.kind == "delete":
+            if os.path.lexists(overlay):
+                overlay.unlink()
+            session.integrated_files[p.path] = DELETED
+            continue
+        write_private_file(overlay, p.source if p.source is not None else b"", mode=0o700 if p.source_mode & 0o111 else 0o600)
+        session.integrated_files[p.path] = keyed_digest(p.content, salt)
 
 
 def _validate_targets(plan: list[PlannedChange], repo: Path, cfg: AISafeConfig) -> None:
@@ -140,20 +179,49 @@ def integrate(
     *,
     confirm: Callable[[ReviewReport, str], bool],
     exclude_paths: tuple[str, ...] = (),
+    only_paths: tuple[str, ...] = (),
+    select: SelectFn | None = None,
     dry_run: bool = False,
     cwd: Path | None = None,
 ) -> IntegrationResult:
     guard_human_context(session, Path(cwd or os.getcwd()))
+    if only_paths and select is not None:
+        raise ValueError("--only and --select cannot be combined")
     repo = session.repo_path
     result = IntegrationResult()
     # Hash before review: integrated_tree_hash must describe the reviewed workspace, not later AI edits.
     reviewed_hash = tree_hash(session.workspace_path)
     review = review_session(session, cfg, scanner, exclude_paths=exclude_paths)
     result.review = review
+    partial = bool(only_paths) or select is not None
+    if partial:
+        from ai_safe.selection import build_rows, dependency_warnings, match_only
+
+        if only_paths:
+            chosen, unmatched = match_only(only_paths, [c.path for c in review.changes])
+            if unmatched:
+                result.aborted, result.usage_error = True, True
+                result.reason = "--only pattern matched no changed file: " + ", ".join(repr(u) for u in unmatched)
+                return result
+        if review.always_blocking():
+            result.aborted, result.reason = True, "review found blocking issues"
+            return result
+        if not only_paths:
+            if not any(r.selectable for r in build_rows(review)):
+                result.aborted, result.reason = True, "no integratable changes"
+                return result
+            chosen = select(review)
+            if not chosen:
+                result.aborted, result.reason = True, "nothing selected"
+                return result
+        review.select(chosen)
+        review.issues.extend(dependency_warnings(review))
     if not review.passed:
         result.aborted, result.reason = True, "review found blocking issues"
         return result
     plan = review.plan
+    result.selected = sorted(review.selected) if review.selected is not None else sorted(p.path for p in plan)
+    result.left_in_workspace = review.left_out()
     if not plan:
         result.aborted, result.reason = True, "no integratable changes"
         return result
@@ -169,7 +237,7 @@ def integrate(
     patch = build_patch(plan, repo)
     stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     patch_path = session.patches_dir / f"{stamp}.patch"
-    write_private_file(patch_path, patch)
+    write_private_file(patch_path, _record_header(result.selected, result.left_in_workspace, partial) + patch)
     result.patch_path = str(patch_path)
 
     if dry_run:
@@ -182,29 +250,37 @@ def integrate(
     # Re-validate right before writing (TOCTOU) and apply atomically.
     _validate_targets(plan, repo, cfg)
     salt = repo_salt(session)
-    for p in plan:
-        target = safe_join(repo, p.path)
-        if p.kind == "delete":
-            if target.is_file() and not target.is_symlink():
-                if keyed_digest(target.read_bytes(), salt) != p.original_digest:
+    done: list[PlannedChange] = []
+    try:
+        for p in plan:
+            target = safe_join(repo, p.path)
+            if p.kind == "delete":
+                if target.is_file() and not target.is_symlink():
+                    if keyed_digest(target.read_bytes(), salt) != p.original_digest:
+                        raise SecurityError(f"original file changed during integration: {p.path}")
+                    target.unlink()
+                    result.deleted.append(p.path)
+                    done.append(p)
+                continue
+            if not p.is_new:
+                current = target.read_bytes().decode("utf-8", "replace")
+                if current != p.original_text:
                     raise SecurityError(f"original file changed during integration: {p.path}")
-                target.unlink()
-                result.deleted.append(p.path)
-            continue
-        if not p.is_new:
-            current = target.read_bytes().decode("utf-8", "replace")
-            if current != p.original_text:
-                raise SecurityError(f"original file changed during integration: {p.path}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        safe_join(repo, p.path)
-        atomic_write(target, p.content, p.mode or 0o644)
-        result.applied.append(p.path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            safe_join(repo, p.path)
+            atomic_write(target, p.content, p.mode or 0o644)
+            result.applied.append(p.path)
+            done.append(p)
+    finally:
+        # Even when a later file aborts, the files already written are recorded.
+        _record_integrated(session, done, salt)
+        session.save()
     session.status = "integrated"
     # Only a full integration of an unchanged workspace means "workspace == what the developer
     # accepted" (resync relies on it). Any edit during review/approval clears it.
     unchanged = tree_hash(session.workspace_path) == reviewed_hash
     # A change review left out (``manual`` binary/mode-only, Git metadata, already-absent deletion, ...)
-    # is not integrated, so resync without --discard would silently drop it.
+    # or the developer did not select is not integrated, so resync without --discard would drop it.
     full = not exclude_paths and not review.left_out()
     session.integrated_tree_hash = reviewed_hash if unchanged and full else None
     session.save()

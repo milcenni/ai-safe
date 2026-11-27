@@ -25,6 +25,8 @@ Review never executes anything from the workspace.
 from __future__ import annotations
 
 import difflib
+import hashlib
+import os
 import re
 import stat
 from dataclasses import dataclass, field
@@ -33,9 +35,10 @@ from pathlib import Path, PurePosixPath
 from ai_safe import git_history as gh
 from ai_safe.classifier import ClaudePath, claude_path_policy, is_security_tool_file, is_sensitive_config, sensitive_match
 from ai_safe.config import AISafeConfig
-from ai_safe.credential_map import CredentialMap
+from ai_safe.credential_map import CredentialMap, load_infra_map, restore_infra
+from ai_safe.infra import PSEUDONYM_RE, leftover_infra
 from ai_safe.models import Category, Issue, Location, Severity, is_blocking
-from ai_safe.patch_manager import FileChange, collect_changes, compute_hunks, map_to_original
+from ai_safe.patch_manager import EntryInfo, FileChange, compute_hunks, detect_renames, diff_index, map_to_original, tree_index
 from ai_safe.php_calls import is_php
 from ai_safe.php_dataflow import trace_php
 from ai_safe.scanner import Scanner
@@ -49,11 +52,13 @@ from ai_safe.security import (
     is_git_metadata_path,
     is_placeholder_value,
     keyed_digest,
+    read_nofollow,
     run_command,
     safe_env,
     safe_relpath,
     secure_mkdtemp,
     secure_remove_tree,
+    sha256_bytes,
 )
 from ai_safe.verifier import known_secret_hits
 from ai_safe.workspace import Session, SessionStore, generated_paths
@@ -61,6 +66,14 @@ from ai_safe.workspace import Session, SessionStore, generated_paths
 _ASSIGN_PLACEHOLDER = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_.\-]*)[\"']?\s*(?::=|=>|=|:)\s*[\"'`]?\$\{(?P<name>AI_SAFE_SECRET_[A-Z0-9_]+)\}")
 _ASSIGN_LITERAL = r"{key}[\"']?\s*(?::=|=>|=|:)\s*(?P<q>[\"'`])(?P<value>[^\"'`\n]+)(?P=q)"
 _IGNORE_FILES = {".gitignore", ".dockerignore"}
+DELETED = "deleted"  # Session.integrated_files value for an integrated deletion
+# Checks that block integration even when the file is not selected (--only/--select): they
+# signal tampering with ai-safe itself or a real credential in the AI's hands, not a file problem.
+ALWAYS_BLOCKING_CODES = frozenset({"marker-tampered", "ai-safe-install", "security-config"})
+
+
+def is_always_blocking(issue: Issue) -> bool:
+    return issue.severity is Severity.CRITICAL or (issue.severity.blocking and issue.code in ALWAYS_BLOCKING_CODES)
 
 
 @dataclass
@@ -73,6 +86,8 @@ class PlannedChange:
     original_text: str | None = None
     credential_lines: set[int] = field(default_factory=set)
     original_digest: str | None = None
+    source: bytes | None = field(default=None, repr=False)  # reviewed workspace bytes (new review baseline)
+    source_mode: int = 0o644
 
 
 @dataclass
@@ -81,11 +96,38 @@ class ReviewReport:
     changes: list[FileChange] = field(default_factory=list)
     issues: list[Issue] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)  # tool metadata, not integrated
-    plan: list[PlannedChange] = field(default_factory=list)
+    plan: list[PlannedChange] = field(default_factory=list)  # what integrate applies ([] when blocked)
+    candidates: list[PlannedChange] = field(default_factory=list)  # every change that passed its own checks
+    renames: list[tuple[str, str]] = field(default_factory=list)  # (deleted path, added path)
+    selected: set[str] | None = None  # None = every change (no --only/--select)
+
+    def blocking_issues(self) -> list[Issue]:
+        """Issues that block integration of the current selection. Without a selection every
+        blocking issue counts. With one, an issue in an unselected file does not block (that
+        file is not written), except the always-blocking checks and issues not tied to a
+        changed path (fail closed)."""
+        blocking = [i for i in self.issues if i.severity.blocking]
+        if self.selected is None:
+            return blocking
+        changed = {c.path for c in self.changes}
+        return [i for i in blocking if is_always_blocking(i) or i.path not in changed or i.path in self.selected]
 
     @property
     def passed(self) -> bool:
-        return not is_blocking(self.issues)
+        return not is_blocking(self.blocking_issues())
+
+    def always_blocking(self) -> list[Issue]:
+        return [i for i in self.issues if is_always_blocking(i)]
+
+    def select(self, paths) -> set[str]:
+        """Restrict the plan to ``paths``. Rename pairs are atomic: either side selects both."""
+        sel = set(paths)
+        for old, new in self.renames:
+            if old in sel or new in sel:
+                sel |= {old, new}
+        self.selected = sel
+        self.plan = [p for p in self.candidates if p.path in sel] if self.passed else []
+        return sel
 
     def left_out(self) -> list[str]:
         """Changed paths that the plan does not integrate, other than tool metadata
@@ -103,6 +145,8 @@ class ReviewReport:
             "passed": self.passed,
             "changes": [{"path": c.path, "kind": c.kind} for c in self.changes],
             "integratable": [{"path": p.path, "action": p.kind} for p in self.plan],
+            "renames": [{"from": a, "to": b} for a, b in self.renames],
+            **({"selected": sorted(self.selected)} if self.selected is not None else {}),
             "skipped": self.skipped,
             "issues": [i.public() for i in sorted(self.issues, key=lambda i: (-i.severity.rank, i.path))],
         }
@@ -119,6 +163,40 @@ def is_tool_metadata(path: str) -> bool:
 
 def repo_salt(session: Session) -> bytes:
     return SessionStore(session.state_path.parent.parent).repo_salt(session.repo_path)
+
+
+def overlay_name(path: str) -> str:
+    """File name of an integrated file's baseline copy in ``Session.integrated_dir``."""
+    return hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def load_baseline(session: Session) -> tuple[dict[str, EntryInfo], dict[str, str]]:
+    """Review baseline: the snapshot, overlaid with the workspace content of every file
+    integrated since (``Session.integrated_files``). Returns the index and the integrated
+    entries in effect. An integrated file whose baseline copy is missing or unreadable is
+    ignored, so it is compared against the snapshot again and its original is reported as
+    changed (fail closed)."""
+    base = tree_index(session.snapshot_dir)
+    effective: dict[str, str] = {}
+    for path, digest in session.integrated_files.items():
+        if digest == DELETED:
+            base.pop(path, None)
+            effective[path] = digest
+            continue
+        src = session.integrated_dir / overlay_name(path)
+        try:
+            data = read_nofollow(src)
+            mode = stat.S_IMODE(os.lstat(src).st_mode)
+        except (OSError, SecurityError):
+            continue
+        base[path] = EntryInfo("file", mode, sha256_bytes(data), len(data), 1, data)
+        effective[path] = digest
+    return base, effective
+
+
+def workspace_changes(session: Session) -> list[FileChange]:
+    """Workspace changes against the review baseline (snapshot + integrated files)."""
+    return diff_index(load_baseline(session)[0], tree_index(session.workspace_path))
 
 
 def ignored_in_original(repo: Path, paths: list[str], skip_dirs: list[str]) -> set[str]:
@@ -150,12 +228,19 @@ def review_session(session: Session, cfg: AISafeConfig, scanner: Scanner, *, exc
 
     manifest = session.load_manifest()
     manifest_files = {f["path"]: f for f in manifest.get("files", [])}
+    baseline, integrated = load_baseline(session)
+    # What the original must still hold: the sanitized original, or what integration wrote.
+    expected: dict[str, str | None] = {p: e.get("original_digest") for p, e in manifest_files.items()}
+    expected.update({p: d for p, d in integrated.items() if d != DELETED})
     cmap = CredentialMap.load(session.state_path)
     known_names = cmap.names()
     fingerprints = cmap.fingerprints()
+    infra_cfg = cfg.sanitization.infrastructure
+    infra_map = load_infra_map(session.state_path)
+    restore = infra_map if infra_cfg.restore_on_integrate else []
     excludes = cfg.sanitization.all_excludes()
     salt = repo_salt(session)
-    changes = collect_changes(snap, ws)
+    changes = diff_index(baseline, tree_index(ws))
     report.changes = changes
     gitleaks_inputs: list[tuple[str, bytes]] = []
     php_changes: dict[str, str] = {}
@@ -226,7 +311,7 @@ def review_session(session: Session, cfg: AISafeConfig, scanner: Scanner, *, exc
             report.add(Severity.WARNING, "sensitive-config", path, "sensitive configuration/build/CI file changed - review carefully before integrating")
 
         if ch.kind == "deleted":
-            _review_deletion(report, ch, manifest_files, cfg, repo, salt)
+            _review_deletion(report, ch, manifest_files, expected, cfg, repo, salt)
             continue
 
         new_bytes = ch.new.data if ch.new else None
@@ -259,7 +344,9 @@ def review_session(session: Session, cfg: AISafeConfig, scanner: Scanner, *, exc
             old_text = ""
             if ch.old is not None and ch.old.data is not None and not is_binary(ch.old.data):
                 old_text = ch.old.data.decode("utf-8")
-            blocked |= _placeholder_checks(report, path, old_text, new_text, known_names)
+            blocked |= _placeholder_checks(report, path, old_text, new_text, known_names,
+                                           restorable={e.placeholder for e in restore})
+            blocked |= _infra_checks(report, path, old_text, new_text, infra_map, infra_cfg)
             blocked |= _hidden_char_checks(report, path, old_text, new_text)
             if PurePosixPath(path).name == ".gitignore":
                 blocked |= _ignore_rule_checks(report, path, old_text, new_text)
@@ -268,16 +355,16 @@ def review_session(session: Session, cfg: AISafeConfig, scanner: Scanner, *, exc
         if ch.kind == "added":
             if path.startswith("."):
                 report.add(Severity.INFO, "hidden-file", path, "new hidden file")
-            _plan_added(report, path, new_bytes, ch, repo)
+            _plan_added(report, path, new_bytes, ch, repo, restore=restore)
         elif ch.kind in ("modified", "mode_changed"):
-            _plan_modified(report, path, new_bytes, new_text, ch, session, manifest_files, repo, salt)
+            _plan_modified(report, path, new_bytes, new_text, ch, expected, repo, salt, restore=restore)
 
     if php_changes:
-        _php_dataflow_checks(report, snap, php_changes, ast=scanner.php_ast)
+        _php_dataflow_checks(report, baseline, php_changes, ast=scanner.php_ast)
     if scanner.gitleaks and gitleaks_inputs:
         _gitleaks_on_changes(report, scanner, gitleaks_inputs)
-    if not report.passed:
-        report.plan = []
+    report.renames = detect_renames(changes)
+    report.plan = list(report.candidates) if report.passed else []
     return report
 
 
@@ -289,33 +376,37 @@ def _safe(path: str) -> bool:
         return False
 
 
-def _php_dataflow_checks(report: ReviewReport, snap: Path, changed: dict[str, str], *, ast: bool) -> None:
+def _baseline_text(baseline: dict[str, EntryInfo], path: str) -> str | None:
+    e = baseline.get(path)
+    if e is None or e.kind != "file" or e.data is None:
+        return None
+    try:
+        return e.data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _php_dataflow_checks(report: ReviewReport, baseline: dict[str, EntryInfo], changed: dict[str, str], *, ast: bool) -> None:
     """Credentials the AI wrote into PHP that reach a credential call only
-    through variables, includes or constants. Context comes from the
-    sanitized snapshot (ai-safe's own copy), overlaid with the changed files;
+    through variables, includes or constants. Context comes from the review
+    baseline (ai-safe's own sanitized copy), overlaid with the changed files;
     only literals on lines the AI added or changed are reported."""
     texts: dict[str, str] = {}
-    for f in sorted(snap.rglob("*")):
-        rel = f.relative_to(snap).as_posix()
-        if is_php(rel) and f.is_file() and not f.is_symlink() and rel not in changed:
-            try:
-                texts[rel] = f.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
+    for rel in sorted(baseline):
+        if is_php(rel) and rel not in changed:
+            text = _baseline_text(baseline, rel)
+            if text is not None:
+                texts[rel] = text
     texts.update(changed)
-    added_lines = {path: _added_lines(path, snap, text) for path, text in changed.items()}
+    added_lines = {path: _added_lines(_baseline_text(baseline, path) or "", text) for path, text in changed.items()}
     for ff in trace_php(texts, ast=ast)[0]:
         if ff.file in added_lines and ff.line in added_lines[ff.file]:
             report.add(Severity.ERROR, "hardcoded-credential", ff.file,
                        f"hardcoded credential introduced ({ff.rule_id}, {ff.category.value})", ff.line)
 
 
-def _added_lines(path: str, snap: Path, new_text: str) -> set[int]:
-    old = snap / path
-    try:
-        old_lines = old.read_text(encoding="utf-8").splitlines() if old.is_file() and not old.is_symlink() else []
-    except (OSError, UnicodeDecodeError):
-        old_lines = []
+def _added_lines(old_text: str, new_text: str) -> set[int]:
+    old_lines = old_text.splitlines()
     new_lines = new_text.splitlines()
     out: set[int] = set()
     for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes():
@@ -342,7 +433,32 @@ def _scan_content(report, scanner: Scanner, path: str, text: str, fingerprints, 
     return blocked
 
 
-def _placeholder_checks(report: ReviewReport, path: str, old_text: str, new_text: str, known_names: set[str]) -> bool:
+def _infra_checks(report: ReviewReport, path: str, old_text: str, new_text: str, infra_map, infra_cfg) -> bool:
+    """Infrastructure values the AI wrote: invented pseudonyms (ERROR) and real
+    internal host names / private IPs it introduced (WARNING)."""
+    if not infra_cfg.enabled:
+        return False
+    blocked = False
+    tokens = {e.token for e in infra_map}
+    for h in compute_hunks(old_text, new_text):
+        added = "".join(h.new_lines)
+        if not added:
+            continue
+        if infra_cfg.mode == "pseudonym":
+            for m in PSEUDONYM_RE.finditer(added):
+                if m.group(0) not in tokens:
+                    report.add(Severity.ERROR, "unknown-pseudonym", path,
+                               "infrastructure pseudonym that is not in the map (fabricated or altered)", h.i1 + 1)
+                    blocked = True
+        if leftover_infra(added, path, infra_cfg, set(infra_cfg.org_domains)):
+            report.add(Severity.WARNING, "host-introduced", path,
+                       "AI introduced a real-looking internal host name or private IP address - prefer configuration "
+                       "or environment variables", h.i1 + 1)
+    return blocked
+
+
+def _placeholder_checks(report: ReviewReport, path: str, old_text: str, new_text: str, known_names: set[str],
+                        restorable: set[str] = frozenset()) -> bool:
     blocked = False
     for name in sorted(set(PLACEHOLDER_NAME_RE.findall(new_text)) - known_names):
         report.add(Severity.ERROR, "unknown-placeholder", path, f"unknown placeholder {name} (fabricated or altered)")
@@ -358,11 +474,16 @@ def _placeholder_checks(report: ReviewReport, path: str, old_text: str, new_text
                 report.add(Severity.ERROR, "placeholder-replaced", path,
                            f"placeholder {m.group('name')} replaced with a literal value", line_no)
                 blocked = True
-        if PLACEHOLDER_NAME_RE.search(added):
+        names = set(PLACEHOLDER_NAME_RE.findall(added))
+        if names - restorable:
             report.add(Severity.ERROR, "placeholder-in-new-code", path,
                        "AI-written line contains an AI_SAFE_SECRET placeholder; it would be integrated literally. "
                        "Use an environment variable / secret manager lookup instead", line_no)
             blocked = True
+        elif names:
+            report.add(Severity.WARNING, "host-placeholder-in-new-code", path,
+                       "AI-written line uses an infrastructure placeholder; it becomes a hardcoded host name after "
+                       "integration - prefer configuration or environment variables", line_no)
     return blocked
 
 
@@ -392,8 +513,9 @@ def _ignore_rule_checks(report: ReviewReport, path: str, old_text: str, new_text
     return False
 
 
-def _review_deletion(report: ReviewReport, ch: FileChange, manifest_files: dict, cfg: AISafeConfig, repo: Path, salt: bytes) -> None:
-    entry = manifest_files.get(ch.path)
+def _review_deletion(report: ReviewReport, ch: FileChange, manifest_files: dict, expected: dict[str, str | None],
+                     cfg: AISafeConfig, repo: Path, salt: bytes) -> None:
+    entry = manifest_files.get(ch.path) or {}
     if not cfg.integration.allow_deletions:
         report.add(Severity.ERROR, "deletion", ch.path, "file deletion not allowed (integration.allow_deletions=false)")
         return
@@ -405,35 +527,41 @@ def _review_deletion(report: ReviewReport, ch: FileChange, manifest_files: dict,
         report.skipped.append(f"{ch.path} (already absent from the original)")
         return
     digest = keyed_digest(target.read_bytes(), salt)
-    if entry is None or entry.get("original_digest") != digest:
+    if expected.get(ch.path) != digest:
         report.add(Severity.ERROR, "original-changed", ch.path, "original file changed since the workspace was created - not deleting; "
                    "run ai-safe resync before the AI continues")
         return
     if entry.get("action") == "sanitized":
         report.add(Severity.WARNING, "credential-file-deleted", ch.path, "AI deleted a file that contains original credentials - review carefully")
-    report.plan.append(PlannedChange(ch.path, "delete", original_digest=digest))
+    report.candidates.append(PlannedChange(ch.path, "delete", original_digest=digest))
 
 
-def _plan_added(report: ReviewReport, path: str, data: bytes, ch: FileChange, repo: Path) -> None:
+def _restore_bytes(data: bytes, restore) -> bytes:
+    if not restore or is_binary(data):
+        return data
+    return restore_infra(data.decode("utf-8"), restore).encode("utf-8")
+
+
+def _plan_added(report: ReviewReport, path: str, data: bytes, ch: FileChange, repo: Path, restore=()) -> None:
     target = repo / path
     if target.exists() or target.is_symlink():
         report.add(Severity.ERROR, "would-overwrite", path,
                    "new file would overwrite an existing original file that was not shared with the AI (excluded or ignored)")
         return
     mode = 0o755 if (ch.new and ch.new.mode & 0o100) else 0o644
-    report.plan.append(PlannedChange(path, "write", data, mode, is_new=True))
+    report.candidates.append(PlannedChange(path, "write", _restore_bytes(data, restore), mode, is_new=True, source=data,
+                                           source_mode=ch.new.mode if ch.new else mode))
 
 
 def _plan_modified(report: ReviewReport, path: str, data: bytes, new_text: str | None, ch: FileChange,
-                   session: Session, manifest_files: dict, repo: Path, salt: bytes) -> None:
-    entry = manifest_files.get(path)
+                   expected: dict[str, str | None], repo: Path, salt: bytes, restore=()) -> None:
     target = repo / path
     if not target.is_file() or target.is_symlink():
         report.add(Severity.ERROR, "original-missing", path, "original file is missing or not a regular file")
         return
     orig_bytes = target.read_bytes()
     digest = keyed_digest(orig_bytes, salt)
-    if entry is None or entry.get("original_digest") != digest:
+    if expected.get(path) != digest:
         report.add(Severity.ERROR, "original-changed", path, "original file changed since the workspace was created (for example by an earlier "
                    "integration) - integrate the other changes, then run ai-safe resync before the AI continues")
         return
@@ -442,15 +570,18 @@ def _plan_modified(report: ReviewReport, path: str, data: bytes, new_text: str |
         report.add(Severity.WARNING, "manual", path, "binary or mode-only change is not integrated automatically")
         return
     snap_text = ch.old.data.decode("utf-8") if ch.old and ch.old.data is not None else ""
-    mapped = map_to_original(snap_text, new_text, orig_bytes.decode("utf-8"), path)
+    # Infrastructure placeholders are restored first, so host-only lines align with the original.
+    mapped = map_to_original(restore_infra(snap_text, restore), restore_infra(new_text, restore),
+                             orig_bytes.decode("utf-8"), path)
     for line, msg in mapped.conflicts:
         report.add(Severity.ERROR, "conflict", path, msg, line)
     for line, msg in mapped.warnings:
         report.add(Severity.WARNING, "credential-removed", path, msg, line)
     if mapped.text is None:
         return
-    report.plan.append(PlannedChange(path, "write", mapped.text.encode("utf-8"), mode, False,
-                                     orig_bytes.decode("utf-8"), mapped.credential_lines_original, digest))
+    report.candidates.append(PlannedChange(path, "write", mapped.text.encode("utf-8"), mode, False,
+                                           orig_bytes.decode("utf-8"), mapped.credential_lines_original, digest,
+                                           source=data, source_mode=ch.new.mode if ch.new else mode))
 
 
 def _gitleaks_on_changes(report: ReviewReport, scanner: Scanner, items: list[tuple[str, bytes]]) -> None:
@@ -465,6 +596,6 @@ def _gitleaks_on_changes(report: ReviewReport, scanner: Scanner, items: list[tup
             if f is None:
                 continue
             report.add(Severity.ERROR, "gitleaks", f.file, f"gitleaks: credential in AI change ({f.rule_id}, {f.category.value})", f.line)
-            report.plan = [p for p in report.plan if p.path != f.file]
+            report.candidates = [p for p in report.candidates if p.path != f.file]
     finally:
         secure_remove_tree(tmp, shred=True)

@@ -219,7 +219,7 @@ _SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
 SECRET_WORDS = {
     "password", "passwd", "pwd", "pw", "pass", "passphrase", "passcode", "secret", "secrets",
     "token", "apikey", "credential", "credentials", "creds", "privatekey", "pat",
-    "connectionstring", "connstr", "dsn", "auth",
+    "connectionstring", "connstr", "dsn", "auth", "salt", "pepper", "signature", "hmac",
 }
 SECRET_BIGRAMS = {
     ("api", "key"), ("access", "key"), ("auth", "key"), ("private", "key"),
@@ -228,6 +228,7 @@ SECRET_BIGRAMS = {
     ("api", "secret"), ("consumer", "secret"), ("connection", "string"), ("auth", "token"),
     ("access", "token"), ("refresh", "token"), ("bearer", "token"), ("shared", "key"),
     ("webhook", "secret"), ("license", "key"), ("sas", "token"), ("storage", "key"),
+    ("app", "key"), ("routing", "key"), ("cookie", "secret"), ("signing", "secret"),
 }
 # Trailing words that indicate the value is *about* a secret, not the secret.
 NON_SECRET_SUFFIXES = {
@@ -238,8 +239,25 @@ NON_SECRET_SUFFIXES = {
     "env", "var", "variable", "enabled", "required", "valid", "validator", "validation",
     "reset", "changed", "updated", "created", "at", "prefix", "suffix", "kind", "mode",
     "provider", "algorithm", "algo", "location", "store", "manager", "lifetime", "version",
-    "cache", "limit", "id", "ids", "hash", "hashed", "digest", "salt", "rounds", "strength",
+    "cache", "limit", "id", "ids", "hash", "hashed", "digest", "rounds", "strength",
 }
+# ``*_id`` names that are credentials (``AWS_ACCESS_KEY_ID``, ``VAULT_SECRET_ID``).
+_ID_EXCEPTIONS = (("access", "key", "id"), ("secret", "id"), ("client", "secret", "id"), ("key", "id"))
+# ``<thing>_key`` is a credential unless the thing is structural (``primary_key``).
+_KEY_STRUCTURAL = {
+    "primary", "foreign", "unique", "cache", "sort", "partition", "hash", "range", "map", "lookup", "index",
+    "row", "column", "route", "router", "translation", "i18n", "l10n", "lang", "locale", "storage", "query",
+    "public", "site", "publishable", "group", "order", "menu", "nav", "item", "list", "field", "form", "state",
+    "store", "event", "component", "element", "node", "tab", "dict", "object", "json", "config", "settings",
+    "option", "options", "meta", "data", "attr", "attribute", "property", "prop", "lock", "idempotency",
+    "dedup", "dedupe", "redis", "memcache", "memcached", "s3", "object", "bucket", "file", "upload", "blob",
+    "path", "search", "filter", "param", "header", "label", "name", "react", "vue", "list", "short", "hot",
+    "keyboard", "shortcut", "primary", "composite", "natural", "surrogate", "foreign", "ssh_public",
+    "message", "msg", "text", "string", "trans", "session_store", "throttle", "rate", "limiter", "queue",
+    "job", "cursor", "page", "next", "prev", "previous", "last", "first", "parent", "child", "sub",
+}
+# Words that name a credential only together with a random-looking value.
+_WEAK_WORDS = {"license"}
 
 
 def key_words(key: str) -> list[str]:
@@ -266,15 +284,14 @@ def split_compound_password(word: str) -> bool:
     return False
 
 
-def is_sensitive_key(key: str | None) -> bool:
-    if not key:
-        return False
-    words = key_words(key)
-    if not words:
-        return False
+def _id_exception(words: list[str]) -> bool:
+    return any(tuple(words[-len(t):]) == t for t in _ID_EXCEPTIONS if len(words) >= len(t))
+
+
+def _strong_sensitive(words: list[str]) -> bool:
     if words[-1] in NON_SECRET_SUFFIXES and len(words) > 1:
-        # "vault_secret_id" style names are still secrets
-        if not (words[-1] == "id" and "secret" in words):
+        # "vault_secret_id" / "aws_access_key_id" style names are still secrets
+        if not (words[-1] == "id" and _id_exception(words)):
             return False
     joined = "".join(words)
     if any(w in SECRET_WORDS or split_compound_password(w) for w in words):
@@ -285,6 +302,78 @@ def is_sensitive_key(key: str | None) -> bool:
         if compact in joined:
             return True
     return False
+
+
+def is_key_suffix_sensitive(words: list[str]) -> bool:
+    """``stripe_key``, ``merchantKey``: a trailing ``key`` after a non-structural word."""
+    return len(words) > 1 and words[-1] == "key" and words[-2] not in _KEY_STRUCTURAL
+
+
+def is_weak_key(key: str | None) -> bool:
+    """Sensitive only by a trailing ``key`` or a weak word (``license``): the
+    value must also look random (see detectors.looks_like_secret_value)."""
+    if not key:
+        return False
+    words = key_words(key)
+    if not words or _strong_sensitive(words):
+        return False
+    if words[-1] in NON_SECRET_SUFFIXES and len(words) > 1:
+        return False
+    return is_key_suffix_sensitive(words) or any(w in _WEAK_WORDS for w in words)
+
+
+def is_sensitive_key(key: str | None) -> bool:
+    if not key:
+        return False
+    words = key_words(key)
+    if not words:
+        return False
+    return _strong_sensitive(words) or is_weak_key(key)
+
+
+DEFAULT_IDENTIFIER_KEYS: tuple[str, ...] = (
+    "client_id", "app_id", "application_id", "tenant_id", "subscription_id", "account_sid",
+    "messaging_service_sid", "merchant_id", "project_id", "location_id", "webhook_id", "chat_id",
+    "keypair_id", "public_key", "publishable_key", "site_key", "tracking_id", "account_number",
+    "meter_number", "account_id", "sid",
+)
+
+
+def is_identifier_key(key: str | None, keys: tuple[str, ...] | list[str] = DEFAULT_IDENTIFIER_KEYS) -> bool:
+    """A key that names a public or semi-public account identifier: the key
+    ends with one of ``keys`` (compared word by word, case-insensitively)."""
+    if not key:
+        return False
+    words = key_words(key)
+    for k in keys:
+        kw = key_words(k)
+        if kw and len(words) >= len(kw) and words[-len(kw):] == kw:
+            return True
+    return False
+
+
+_USER_SUFFIXES = (("user",), ("username",), ("login",), ("uid",), ("account",), ("user", "name"),
+                  ("bind", "dn"), ("sasl", "username"), ("root", "user"), ("default", "user"), ("usr",))
+
+
+def is_user_key(key: str | None) -> bool:
+    """``user``, ``DB_USERNAME``, ``MONGO_INITDB_ROOT_USERNAME``, ``bind_dn``, ``$dbuser``."""
+    if not key:
+        return False
+    words = key_words(key)
+    if not words:
+        return False
+    if any(len(words) >= len(t) and tuple(words[-len(t):]) == t for t in _USER_SUFFIXES):
+        return True
+    return len(words) == 1 and any(words[0] == p + "user" for p in _COMPOUND_PW_PREFIXES)
+
+
+def key_group(key: str | None) -> tuple[str, ...]:
+    """Words before the last word: ``DB_USER`` and ``DB_PASS`` share ``("db",)``."""
+    words = key_words(key or "")
+    if len(words) >= 2 and words[-2:] in (["user", "name"], ["bind", "dn"]):
+        return tuple(words[:-2])
+    return tuple(words[:-1])
 
 
 def is_password_key(key: str | None) -> bool:
@@ -305,6 +394,8 @@ _DB_HINTS = ("db", "database", "postgres", "postgresql", "pg", "mysql", "mariadb
              "dsn", "jdbc", "connectionstring", "connstr")
 _TOKEN_HINTS = ("token", "github", "gitlab", "slack", "bearer", "pat", "npm", "pypi",
                 "discord", "telegram", "twilio-auth", "oauth", "refresh", "session")
+_API_PROVIDERS = ("stripe", "sendgrid", "mailgun", "mailchimp", "twilio", "algolia", "pusher", "merchant",
+                  "fedex", "ups", "paypal", "braintree", "square", "openai", "anthropic")
 _API_HINTS = ("api-key", "apikey", "api_key", "openai", "anthropic", "stripe", "sendgrid",
               "mailgun", "mailchimp", "twilio", "algolia", "api")
 
@@ -335,7 +426,8 @@ def categorize(rule_id: str, key: str | None = None, secret: str = "", file: str
         return Category.CLOUD_CREDENTIAL
     if any(w in wordset for w in ("password", "passwd", "pwd", "pass", "passphrase", "passcode")):
         return Category.PASSWORD
-    if any(h in rid for h in _API_HINTS) or "apikey" in joined or ("api" in wordset and "key" in wordset):
+    if any(h in rid for h in _API_HINTS) or "apikey" in joined or ("api" in wordset and "key" in wordset) \
+            or (words and words[-1] == "key" and any(h in wordset for h in _API_PROVIDERS)):
         return Category.API_KEY
     if any(h in rid for h in _TOKEN_HINTS) or "token" in wordset or "token" in joined:
         return Category.ACCESS_TOKEN

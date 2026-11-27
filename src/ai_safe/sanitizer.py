@@ -28,11 +28,13 @@ from ai_safe import git_history as gh
 from ai_safe.classifier import ClaudePath, claude_path_policy, sensitive_match
 from ai_safe.config import AISafeConfig
 from ai_safe.detectors import PRIVATE_KEY_HEADER, PUTTY_KEY
-from ai_safe.credential_map import CredentialMap
+from ai_safe.credential_map import CredentialMap, save_infra_map
+from ai_safe.infra import pseudonym
 from ai_safe.models import WORKING_TREE_LOCATIONS, Finding, Location
-from ai_safe.redaction import CHECK_MIN_LEN, PlaceholderRegistry, RedactionError, redact_text
+from ai_safe.redaction import CHECK_MIN_LEN, EXPAND, TOKEN, PlaceholderRegistry, RedactionError, is_embedded, redact_text
 from ai_safe.scanner import Scanner, ScanResult
 from ai_safe.security import (
+    INFRA_PREFIXES,
     REDACTOR,
     SecurityError,
     is_binary,
@@ -126,8 +128,16 @@ class Sanitizer:
         exact = [f for f in scan.findings if f.exact and f.secret]
         wt = sorted((f for f in exact if f.location in WORKING_TREE_LOCATIONS), key=lambda f: (f.file, f.line, f.rule_id))
         other = sorted((f for f in exact if f.location not in WORKING_TREE_LOCATIONS), key=lambda f: (f.location.value, f.file, f.line, f.rule_id))
+        infra_cfg = self.cfg.sanitization.infrastructure
         for f in wt + other:
-            registry.register(f.secret, f.category, f.key)
+            loc = (f.file, f.line) if f.location in WORKING_TREE_LOCATIONS else None
+            if f.kind:
+                e = registry.register(f.secret, f.category, f.key, location=loc, prefix=INFRA_PREFIXES[f.kind], kind=f.kind)
+                if infra_cfg.mode == "pseudonym" and e.pseudonym is None:
+                    e.pseudonym = pseudonym(f.kind, e.fingerprint, e.original)
+            else:
+                registry.register(f.secret, f.category, f.key, location=loc)
+        registry.finalize_shared()
         try:
             registry.fix_unsafe_names()
         except RedactionError:
@@ -153,16 +163,18 @@ class Sanitizer:
             entries.append(ManifestEntry(HISTORY_SUMMARY_FILE, "generated", "sanitized Git history summary", sha256=sha256_bytes(text.encode())))
 
         cmap = CredentialMap.from_registry(registry)
-        placeholders_doc = _placeholders_doc(cmap)
+        placeholders_doc = _placeholders_doc(cmap, scan.engines)
         write_private_file(ws / PLACEHOLDERS_FILE, placeholders_doc, mode=0o644)
         install_claude_integration(ws, state_root_path, self.cfg, self._team_settings)
 
         cmap.save(session.state_path, registry, store_secret_values=self.cfg.security.store_secret_values, passphrase=passphrase)
+        save_infra_map(session.state_path, registry, mode=infra_cfg.mode)
         manifest = {
             "version": 1,
             "session_id": session.id,
             "created_at": _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat(),
             "is_git_repository": scan.is_git,
+            "engines": list(scan.engines),
             "files": [asdict(e) for e in entries],
             "summary": {
                 "sanitized": sum(1 for e in entries if e.action == "sanitized"),
@@ -303,10 +315,20 @@ class Sanitizer:
 
     def _final_sweep(self, ws: Path, entries: list[ManifestEntry], registry: PlaceholderRegistry) -> list[str]:
         """Remove any written file that still contains a known secret value."""
-        secrets_ = [e.secret for e in registry.entries() if len(e.secret) >= CHECK_MIN_LEN]
-        if not secrets_:
+        known = [e for e in registry.entries() if len(e.secret) >= CHECK_MIN_LEN and e.propagate in (EXPAND, TOKEN)]
+        if not known:
             return []
-        pattern = re.compile("|".join(re.escape(s) for s in sorted(secrets_, key=len, reverse=True)))
+        pattern = re.compile("|".join(re.escape(e.secret) for e in sorted(known, key=lambda e: len(e.secret), reverse=True)))
+        token_only = {e.secret for e in known if e.propagate == TOKEN}
+
+        def leaked(content: str) -> bool:
+            # Values are matched longest first; a low-entropy value counts only as a whole token.
+            for s in {e.secret for e in known}:
+                for m in re.finditer(re.escape(s), content):
+                    if s not in token_only or not is_embedded(content, m.start(), m.end()):
+                        return True
+            return False
+
         warnings = []
         for e in entries:
             if e.action not in ("sanitized", "copied"):
@@ -315,7 +337,7 @@ class Sanitizer:
             if p.is_symlink() or not p.is_file():
                 continue
             content = p.read_bytes().decode("utf-8", "replace") if not is_binary(p.read_bytes()) else p.read_bytes().decode("latin-1")
-            if pattern.search(content):
+            if pattern.search(content) and leaked(content):
                 secure_remove_file(p, shred=True)
                 e.action, e.reason, e.sha256 = "excluded", "known secret value still present after redaction - fail closed", None
                 warnings.append(f"{e.path}: removed from workspace (known secret value present)")
@@ -355,7 +377,8 @@ def history_summary(repo: Path, scanner: Scanner, registry: PlaceholderRegistry,
     return "\n".join(lines) + "\n"
 
 
-def _placeholders_doc(cmap: CredentialMap) -> str:
+def _placeholders_doc(cmap: CredentialMap, engines: list[str] | None = None) -> str:
+    engines = engines or []
     lines = [
         "# AI-safe placeholders",
         "",
@@ -364,11 +387,31 @@ def _placeholders_doc(cmap: CredentialMap) -> str:
         "requested or recovered. Code should read credentials from environment variables or a",
         "secret manager; report any new credential you need as a placeholder requirement.",
         "",
-        "| Placeholder | Category | Files |",
-        "|---|---|---|",
+        f"Detection engines: {', '.join(engines) if engines else 'unknown'}"
+        + ("" if "gitleaks" in engines or not engines else " (builtin only: Gitleaks did not run)") + ".",
+        "",
     ]
-    for e in cmap.entries:
-        if not e.files:
-            continue
-        lines.append(f"| `{e.placeholder}` | {e.category} | {', '.join(e.files[:10])} |")
+    secrets_ = [e for e in cmap.entries if e.files and e.category not in ("IDENTIFIER", "USERNAME") and e.kind is None]
+    users = [e for e in cmap.entries if e.files and e.category == "USERNAME"]
+    idents = [e for e in cmap.entries if e.files and e.category == "IDENTIFIER"]
+    infra = [e for e in cmap.entries if e.files and e.kind is not None]
+    lines += ["## Credentials", "", "| Placeholder | Category | Files | Also used as |", "|---|---|---|---|"]
+    for e in secrets_:
+        lines.append(f"| `{e.placeholder}` | {e.category} | {', '.join(e.files[:10])} | {', '.join(e.also_used_as)} |")
+    if users:
+        lines += ["", "## User names", "", "User names next to a credential. Not secrets, but hidden.", "",
+                  "| Placeholder | Files |", "|---|---|"]
+        lines += [f"| `{e.placeholder}` | {', '.join(e.files[:10])} |" for e in users]
+    if idents:
+        lines += ["", "## Identifiers", "", "Account, tenant and client IDs, publishable keys, phone numbers.",
+                  "Not credentials, but they identify the organisation's accounts.", "",
+                  "| Placeholder | Files |", "|---|---|"]
+        lines += [f"| `{e.placeholder}` | {', '.join(e.files[:10])} |" for e in idents]
+    if infra:
+        lines += ["", "## Infrastructure placeholders", "",
+                  "Real host names, domains, IP addresses, buckets and cloud account IDs. Reference an existing",
+                  "placeholder where the same host is meant; never invent new ones or try to resolve them.",
+                  "In new code, read hosts from configuration or environment variables.", "",
+                  "| Placeholder | Kind | Files |", "|---|---|---|"]
+        lines += [f"| `{e.placeholder}` | {e.kind} | {', '.join(e.files[:10])} |" for e in infra]
     return "\n".join(lines) + "\n"

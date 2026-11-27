@@ -27,6 +27,7 @@ from ai_safe.detectors import PRIVATE_KEY_HEADER, PUTTY_KEY
 from ai_safe.models import Issue, Location, Severity, is_blocking
 from ai_safe.scanner import Scanner
 from ai_safe.security import MARKER_FILE, hmac_fingerprint, is_binary, is_placeholder_value, is_within, symlink_target_escapes, walk_nofollow
+from ai_safe.verify_checks import run_checks
 from ai_safe.workspace import generated_paths, tree_hash
 
 _TOKEN_SPLIT = re.compile(r"[\s\"'`,;()\[\]{}<>|]+")
@@ -107,6 +108,8 @@ def verify_workspace(
     ws = Path(ws).resolve()
     report = VerificationReport(workspace=str(ws))
     report.engines = ["builtin"] + (["gitleaks"] if scanner.gitleaks else []) + (["fingerprints"] if fingerprints else [])
+    if not scanner.gitleaks:
+        report.add(Severity.INFO, "engines", ".", "builtin detection only: Gitleaks did not run")
     excludes = cfg.sanitization.all_excludes()
     generated = generated_paths()
     max_bytes = cfg.scanner.max_file_size_kb * 1024
@@ -178,7 +181,8 @@ def verify_workspace(
                 report.add(Severity.ERROR, "unexpected-binary", rel, "unexpected binary file")
         else:
             text = data.decode("utf-8")
-        _check_text(report, scanner, text, rel, fingerprints)
+        _check_text(report, scanner, text, rel, fingerprints,
+                    infra=cfg.sanitization.infrastructure if rel not in generated else None)
 
     if scanner.gitleaks:
         for rec in scanner.gitleaks.scan_dir(ws):
@@ -191,16 +195,20 @@ def verify_workspace(
     return report
 
 
-def _check_text(report: VerificationReport, scanner: Scanner, text: str, rel: str, fingerprints: dict[str, str] | None) -> None:
+def _check_text(report: VerificationReport, scanner: Scanner, text: str, rel: str, fingerprints: dict[str, str] | None,
+                kept_suffixes: tuple[str, ...] = (), infra=None) -> None:
     for m in PRIVATE_KEY_HEADER.finditer(text):
         line = text.count("\n", 0, m.start()) + 1
         report.add(Severity.CRITICAL, "private-key", rel, "private key material present", line)
     if PUTTY_KEY.search(text):
         report.add(Severity.CRITICAL, "private-key", rel, "PuTTY private key present")
+    flagged: set[int] = set()
     for m in scanner.detector.scan_text(text, rel):
         if m.rule_id.startswith("private-key") or is_placeholder_value(m.secret):
             continue
+        flagged.add(m.line)
         report.add(Severity.CRITICAL, "unresolved-secret", rel, f"unresolved secret ({m.rule_id}, {m.category.value})", m.line)
+    run_checks(report, text, rel, kept_suffixes=kept_suffixes, flagged_lines=flagged, infra=infra)
     if fingerprints:
         for name in sorted(known_secret_hits(text, fingerprints, scanner.salt)):
             report.add(Severity.CRITICAL, "known-secret", rel, f"original credential value for {name} is present")

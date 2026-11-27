@@ -18,10 +18,13 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-from ai_safe.classifier import categorize, file_kind, is_password_key, is_sensitive_key, key_words
-from ai_safe.config import CustomRule
+from ai_safe.classifier import (
+    categorize, file_kind, is_password_key, is_sensitive_key, is_user_key, is_weak_key,
+    key_group, key_words,
+)
+from ai_safe.config import CustomRule, IdentifierConfig, UsernameConfig
 from ai_safe.models import Category
-from ai_safe.php_calls import find_call_credentials, is_php
+from ai_safe.php_calls import _DEFAULT_USERS, _HOST_RE, _IP_RE, find_call_credentials, is_php
 from ai_safe.security import PLACEHOLDER_NAME_RE, is_placeholder_value
 
 
@@ -72,7 +75,19 @@ TOKEN_RULES: tuple[TokenRule, ...] = (
     TokenRule("mailgun-api-key", _r(r"\b(?P<secret>key-[0-9a-zA-Z]{32})\b"), Category.API_KEY),
     TokenRule("jwt", _r(r"\b(?P<secret>eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})"), Category.ACCESS_TOKEN),
     TokenRule("bearer-token", _r(r"(?i)\bbearer\s+(?P<secret>[A-Za-z0-9\-._~+/]{20,}=*)"), Category.ACCESS_TOKEN),
-    TokenRule("url-credentials", _r(r"\b[a-zA-Z][a-zA-Z0-9+.\-]{1,20}://[^\s:/@'\"`]{0,128}:(?P<secret>[^\s@'\"`/]{1,256})@[^\s'\"`]+"), Category.DATABASE_CREDENTIAL),
+    # The password may contain '@' (drivers split userinfo at the *last* '@' before the host).
+    TokenRule("url-credentials", _r(
+        r"\b[a-zA-Z][a-zA-Z0-9+.\-]{1,20}://[^\s:/@'\"`]{0,128}:"
+        r"(?P<secret>[^\s'\"`/]{1,256}?)"
+        r"@(?=[A-Za-z0-9\[][A-Za-z0-9\[\]._\-%:]*(?:[/?#'\"`\s,;)]|$))"
+        r"(?![^\s'\"`/?#]*@)"
+    ), Category.DATABASE_CREDENTIAL),
+    # Password hashes can be cracked offline: replaced whole.
+    TokenRule("password-hash", _r(
+        r"(?P<secret>\$2[abxy]\$\d{2}\$[./A-Za-z0-9]{53}"
+        r"|\$argon2(?:id|i|d)\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/]+\$[A-Za-z0-9+/]+"
+        r"|\$[56]\$(?:rounds=\d+\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{43,86})(?![./A-Za-z0-9])"
+    ), Category.PASSWORD),
     TokenRule("url-username-token", _r(r"\b[a-zA-Z][a-zA-Z0-9+.\-]{1,20}://(?P<secret>[A-Za-z0-9_\-]{20,256})(?::[^\s@'\"`/]*)?@[^\s'\"`]+"), Category.ACCESS_TOKEN),
     TokenRule("basic-auth-header", _r(r"(?i)\bbasic\s+(?P<secret>[A-Za-z0-9+/]{12,}={0,2})(?![A-Za-z0-9+/=])"), Category.PASSWORD),
     TokenRule("query-password", _r(r"(?i)[?&;](?:password|passwd|pwd|pass|secret|token|api_?key|access_token)=(?P<secret>[^&;\s\"'`#]{1,256})"), Category.PASSWORD),
@@ -84,7 +99,69 @@ TOKEN_RULES: tuple[TokenRule, ...] = (
     TokenRule("mysql-p-flag", _r(r"\bmysql\w*\b[^\n]*?\s-p(?P<secret>[^\s\"'`;|&<>]{1,256})"), Category.DATABASE_CREDENTIAL),
     TokenRule("sshpass-flag", _r(r"\bsshpass\s+-p\s*(?P<q>[\"']?)(?P<secret>[^\s\"']{1,256})(?P=q)"), Category.PASSWORD),
     TokenRule("curl-user", _r(r"\bcurl\b[^\n]*?\s(?:-u|--user)[ =]?(?P<q>[\"']?)[^\s:\"']+:(?P<secret>[^\s\"']{1,256})(?P=q)"), Category.PASSWORD),
+    # libpq conninfo (``host=... password=...``), in any language and any variable
+    TokenRule("libpq-password", _r(r"(?i)\b(?:host|hostaddr|dbname|user)\s*=[^\"'\n]*?\bpassword\s*=\s*(?:'(?P<secret>[^'\n]{1,256})'|(?P<secret2>[^\s'\"]{1,256}))"), Category.DATABASE_CREDENTIAL),
+    # Webhook URLs carry their token in the path
+    TokenRule("discord-webhook", _r(r"(?P<secret>https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d{5,30}/[A-Za-z0-9_\-]{20,})"), Category.ACCESS_TOKEN),
+    TokenRule("teams-webhook", _r(r"(?P<secret>https://[a-z0-9\-]+\.webhook\.office\.com/webhookb2/[^\s'\"`]{20,})"), Category.ACCESS_TOKEN),
+    TokenRule("generic-webhook", _r(r"(?P<secret>https://[^\s'\"`/]+/(?:[^\s'\"`]*/)?(?:webhooks?|hooks)/[^\s'\"`]*[A-Za-z0-9_\-]{24,}[^\s'\"`]*)"), Category.ACCESS_TOKEN),
+    # Provider formats anchored by a distinctive prefix
+    TokenRule("stripe-webhook-secret", _r(r"\b(?P<secret>whsec_[A-Za-z0-9]{24,})\b"), Category.API_KEY),
+    TokenRule("square-access-token", _r(r"\b(?P<secret>sq0atp-[\w\-]{22,}|sq0csp-[\w\-]{40,})"), Category.ACCESS_TOKEN),
+    TokenRule("square-oauth-token", _r(r"(?<![A-Za-z0-9+/=])(?P<secret>EAAA[\w\-]{60,})"), Category.ACCESS_TOKEN),
+    TokenRule("hubspot-private-app", _r(r"\b(?P<secret>pat-(?:na|eu)\d-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"), Category.ACCESS_TOKEN),
+    TokenRule("mailchimp-api-key", _r(r"\b(?P<secret>[0-9a-f]{32}-us\d{1,2})\b"), Category.API_KEY),
+    TokenRule("facebook-access-token", _r(r"(?<![A-Za-z0-9+/=])(?P<secret>EAA[A-Za-z0-9]{20,})"), Category.ACCESS_TOKEN),
+    TokenRule("google-oauth-client-secret", _r(r"\b(?P<secret>GOCSPX-[A-Za-z0-9_\-]{28})"), Category.API_KEY),
+    TokenRule("firebase-fcm-server-key", _r(r"\b(?P<secret>AAAA[A-Za-z0-9_\-]{7}:APA91b[A-Za-z0-9_\-]{100,})"), Category.API_KEY),
+    TokenRule("telegram-bot-token", _r(r"(?:(?<=['\"])|(?<=bot))(?P<secret>\d{8,10}:[A-Za-z0-9_\-]{35})(?![A-Za-z0-9_\-])"), Category.ACCESS_TOKEN),
+    TokenRule("digitalocean-token", _r(r"\b(?P<secret>do[opr]_v1_[0-9a-f]{64})\b"), Category.CLOUD_CREDENTIAL),
+    TokenRule("azure-ad-client-secret", _r(r"(?<![A-Za-z0-9_~.\-])(?P<secret>[A-Za-z0-9_~.\-]{3}\dQ~[A-Za-z0-9_~.\-]{31,34})(?![A-Za-z0-9_~.\-])"), Category.CLOUD_CREDENTIAL),
+    TokenRule("planetscale-token", _r(r"\b(?P<secret>pscale_(?:pw|tkn|oauth)_[A-Za-z0-9_\-.]{32,})"), Category.DATABASE_CREDENTIAL),
+    TokenRule("supabase-management-token", _r(r"\b(?P<secret>sbp_[0-9a-f]{40})\b"), Category.ACCESS_TOKEN),
+    TokenRule("shopify-token", _r(r"\b(?P<secret>shp(?:at|ss|ca|pa)_[0-9a-fA-F]{32})\b"), Category.ACCESS_TOKEN),
+    TokenRule("vault-token", _r(r"\b(?P<secret>hv[sb]\.[A-Za-z0-9_\-]{24,})"), Category.ACCESS_TOKEN),
+    TokenRule("doppler-token", _r(r"\b(?P<secret>dp\.(?:st|pt|ct|sa|scim|audit)\.[A-Za-z0-9_\-]{40,})"), Category.ACCESS_TOKEN),
+    TokenRule("atlassian-api-token", _r(r"\b(?P<secret>ATATT3[A-Za-z0-9_\-=]{150,})"), Category.ACCESS_TOKEN),
+    TokenRule("bitbucket-app-password", _r(r"\b(?P<secret>ATBB[A-Za-z0-9]{28,})\b"), Category.ACCESS_TOKEN),
+    TokenRule("postman-api-key", _r(r"\b(?P<secret>PMAK-[0-9a-f]{24}-[0-9a-f]{34})\b"), Category.API_KEY),
+    TokenRule("newrelic-key", _r(r"\b(?P<secret>NRAK-[A-Z0-9]{27}|NRII-[A-Za-z0-9_\-]{32}|[0-9a-fA-F]{36}NRAL)\b"), Category.API_KEY),
+    TokenRule("sentry-auth-token", _r(r"\b(?P<secret>sntry[su]_[A-Za-z0-9+/=_\-]{40,})"), Category.ACCESS_TOKEN),
+    TokenRule("sentry-dsn", _r(r"https://(?P<secret>[0-9a-f]{32})@[^/\s'\"`]+/\d+"), Category.ACCESS_TOKEN),
+    TokenRule("age-secret-key", _r(r"\b(?P<secret>AGE-SECRET-KEY-1[0-9A-Z]{58})\b"), Category.PRIVATE_KEY),
+    TokenRule("gcp-api-key-lenient", _r(r"\b(?P<secret>AIza[0-9A-Za-z_\-]{30,45})(?![0-9A-Za-z_\-])"), Category.CLOUD_CREDENTIAL),
+    # Any distinctive provider prefix with a random-looking tail (also the verify prefix sweep)
+    TokenRule("provider-prefix", _r(
+        r"(?<![A-Za-z0-9_\-])(?P<secret>(?:AIza|sq0atp-|sq0csp-|xox[abeoprs]-|gh[pousr]_|github_pat_|gl(?:pat|dt|ptt|rt)-"
+        r"|(?:sk|rk)_(?:live|test)_|whsec_|sk-ant-|sk-proj-|GOCSPX-|do[opr]_v1_|pscale_(?:pw|tkn|oauth)_|sbp_"
+        r"|shp(?:at|ss|ca|pa)_|hv[sb]\.|PMAK-|NRAK-|sntry[su]_|AGE-SECRET-KEY-1|ATATT3|pypi-AgEI|SG\.)"
+        r"(?=[A-Za-z0-9_\-.]*\d)[A-Za-z0-9_\-.]{8,})"
+    ), Category.API_KEY),
 )
+
+# Public or semi-public identifiers (IDENTIFIER tier, sanitization.identifiers)
+IDENTIFIER_RULES: tuple[TokenRule, ...] = (
+    TokenRule("stripe-publishable-key", _r(r"\b(?P<secret>pk_(?:live|test)_[A-Za-z0-9]{16,})\b"), Category.IDENTIFIER),
+    TokenRule("square-application-id", _r(r"\b(?P<secret>sq0idp-[\w\-]{20,})"), Category.IDENTIFIER),
+    TokenRule("twilio-sid", _r(r"\b(?P<secret>(?:AC|MG)[0-9a-f]{32})\b"), Category.IDENTIFIER),
+    TokenRule("aws-account-in-arn", _r(r"\barn:aws[\w-]*:[\w-]+:[\w-]*:(?P<secret>\d{12}):"), Category.IDENTIFIER),
+    TokenRule("phone-number", _r(r"(?<=['\"])(?P<secret>\+\d{8,15})(?=['\"])"), Category.IDENTIFIER),
+)
+
+# Distinctive provider prefixes (and suffixes): under a sensitive key such a
+# value is a credential reference even when truncated or low-entropy.
+PROVIDER_PREFIX = re.compile(
+    r"^(?:AIza|SG\.|sq0atp-|sq0csp-|EAA|IGQV|eyJ|xox[abeoprs]-|gh[pousr]_|github_pat_|gl(?:pat|dt|ptt|rt)-"
+    r"|(?:sk|rk)_(?:live|test)_|whsec_|sk-|pat-(?:na|eu)\d-|GOCSPX-|AKIA|ASIA|do[opr]_v1_|pscale_|sbp_"
+    r"|shp(?:at|ss|ca|pa)_|hv[sb]\.|dp\.(?:st|pt|ct|sa|scim|audit)\.|PMAK-|NRAK-|NRII-|sntry[su]_"
+    r"|AGE-SECRET-KEY-|ATATT3|ATBB|npm_|pypi-|key-)"
+    r"|-us\d{1,2}$|NRAL$"
+)
+
+
+def has_provider_prefix(value: str) -> bool:
+    v = value.strip()
+    return bool(PROVIDER_PREFIX.search(v)) and len(v) >= 8
 
 PRIVATE_KEY_BLOCK = _r(
     r"-----BEGIN (?P<label>[A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----"
@@ -114,7 +191,101 @@ AUTH_PAIR = _r(r"(?i)\b(?:HTTPBasicAuth|HTTPDigestAuth|BasicAuth|DigestAuth|basi
 WRAPPED_ASSIGN = _r(_KEY + r"[\"']?\s*(?::=|=|:)\s*(?:new\s+String|String|\[\]byte|bytes?|b|str|Buffer\.from|SecretStr|Secret|Password|Some|Optional\.of)\s*\(\s*(?P<q>[\"'`])(?P<secret>[^\"'`\n]{1,2048})(?P=q)")
 ENV_DEFAULT = _r(r"(?:(?<![\w$>.])env|getenv|environ\.get|ENV\.fetch|env\.get|os\.Getenv(?:OrDefault)?|config\.get|getProperty)\s*\(\s*(?P<kq>[\"'])(?P<key>[^\"'\n]{1,80})(?P=kq)\s*,\s*(?P<q>[\"'`])(?P<secret>[^\"'`\n]{1,2048})(?P=q)")
 INDEX_ASSIGN = _r(r"\[\s*(?P<kq>[\"'])(?P<key>[A-Za-z_][\w.\-]{0,80})(?P=kq)\s*\]\s*=(?![=>])\s*(?P<q>[\"'`])(?P<secret>(?:\\.|(?!(?P=q))[^\\\n]){1,2048})(?P=q)")
-COMMENT_SECRET = _r(r"(?im)^[ \t]*(?:#|//|--|;|\*|/\*|<!--|REM\b)[^\n]*?\b(?P<key>password|passwd|pwd|passphrase|secret|token|api[ _-]?key)\b[ \t]*(?:is|was|=|:|->)?[ \t]*(?P<q>[\"'`]?)(?P<secret>[^\s\"'`]{6,256})(?P=q)")
+# Trailing closing punctuation (``(password: x)``, ``x.``) stays in the text.
+COMMENT_SECRET = _r(r"(?im)^[ \t]*(?:#|//|--|;|\*|/\*|<!--|REM\b)[^\n]*?\b(?P<key>password|passwd|pwd|passphrase|secret|token|api[ _-]?key)\b[ \t]*(?:is|was|=|:|->)?[ \t]*(?P<q>[\"'`]?)(?P<secret>[^\s\"'`]{6,256}?)(?P=q)(?=[)\]},;.]*(?:\s|$))")
+
+# Environment fallbacks: ``getenv('X') ?: 'v'``, ``$_SERVER['X'] ?? 'v'``,
+# ``process.env.X || 'v'``, ``os.environ.get('X') or 'v'``, ``${X:-v}``.
+ENV_FALLBACK_OP = _r(
+    r"(?<![A-Za-z0-9_])(?:getenv|env|apache_getenv|\$_(?:SERVER|ENV)|os\.environ\.get|os\.getenv|process\.env)"
+    r"\s*(?:\(\s*|\[\s*|\.)(?P<kq>[\"']?)(?P<key>[A-Za-z_][\w.\-]{0,80})(?P=kq)\s*[\])]?"
+    r"\s*(?:\?:|\?\?|\|\||\bor\b)\s*"
+    r"(?P<q>[\"'`])(?P<secret>(?:\\.|(?!(?P=q))[^\\\n]){1,2048})(?P=q)"
+)
+SHELL_DEFAULT = _r(r"\$\{(?P<key>[A-Za-z_]\w*):?[-=](?P<secret>[^}\s]{1,2048})\}")
+
+# Containers whose name is sensitive: their string leaves are candidates.
+CONTAINER_START = _r(r"(?P<name>\$?[A-Za-z_]\w*|(?P<nq>['\"])[A-Za-z_][\w.\-]*(?P=nq))\s*(?:=|=>|:)\s*(?:array\s*\(|\[|\{)")
+FUNCTION_DEF = _r(r"\bfunction\s+&?\s*(?P<name>[A-Za-z_]\w*)\s*\([^)]*\)[^{;]*\{")
+RETURN_ARRAY = _r(r"\breturn\s+(?:array\s*\(|\[|\{)")
+LEAF_LITERAL = _r(
+    r"(?:(?P<kq>['\"])(?P<leafkey>[^'\"\n]{1,80})(?P=kq)\s*(?:=>|:)\s*)?"
+    r"(?P<q>['\"])(?P<secret>(?:\\.|(?!(?P=q))[^\\\n]){1,2048})(?P=q)(?!\s*(?:=>|:))"
+)
+YAML_PARENT = _r(r"^(?P<indent>[ \t]*)(?P<key>[A-Za-z_][\w.\-]{0,80}):[ \t]*(?:#.*)?$", re.MULTILINE)
+YAML_CHILD = _r(r"^(?P<indent>[ \t]+)(?P<key>[A-Za-z_][\w.\-]{0,80}):[ \t]+(?P<secret>[^\n#]+?)[ \t]*$", re.MULTILINE)
+_CONTAINER_WORDS = {"keys", "secrets", "credentials", "creds", "tokens", "passwords", "passwds", "apikeys"}
+_CONTAINER_FUNC_WORDS = {"key", "keys", "secret", "secrets", "credential", "credentials", "token", "tokens",
+                         "password", "passwords"}
+_NOT_SECRET_LEAF_WORDS = {"host", "hostname", "server", "url", "uri", "endpoint", "region", "port", "name", "driver",
+                          "database", "db", "scheme", "path", "timeout", "version", "type", "mode", "env",
+                          "environment", "label", "description", "title", "id", "email", "domain", "bucket"}
+_SIBLING_SECRET_CATEGORIES = frozenset({
+    Category.PASSWORD, Category.DATABASE_CREDENTIAL, Category.ACCESS_TOKEN, Category.API_KEY,
+    Category.GENERIC_SECRET, Category.CLOUD_CREDENTIAL, Category.JWT_SECRET,
+})
+
+
+def is_container_name(name: str, function: bool = False) -> bool:
+    words = key_words(name)
+    if not words:
+        return False
+    if function:
+        return words[0] == "get" and words[-1] in _CONTAINER_FUNC_WORDS
+    return words[-1] in _CONTAINER_WORDS or (is_sensitive_key(name) and not is_weak_key(name))
+
+
+def _match_bracket(text: str, open_idx: int, limit: int = 20000) -> int | None:
+    """Index of the bracket closing ``text[open_idx]`` (quotes respected)."""
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    if open_idx >= len(text) or text[open_idx] not in pairs:
+        return None
+    stack = [pairs[text[open_idx]]]
+    i, n = open_idx + 1, min(len(text), open_idx + limit)
+    while i < n:
+        c = text[i]
+        if c in "'\"`":
+            j = i + 1
+            while j < n and text[j] != c:
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c in pairs:
+            stack.append(pairs[c])
+        elif c in ")]}":
+            if c != stack.pop():
+                return None
+            if not stack:
+                return i
+        i += 1
+    return None
+
+
+def _not_secret_leaf(leaf_key: str) -> bool:
+    return bool(set(key_words(leaf_key)) & _NOT_SECRET_LEAF_WORDS) or is_user_key(leaf_key)
+
+
+def _hostish_value(v: str) -> bool:
+    v = v.strip()
+    return bool(_IP_RE.match(v) or _HOST_RE.match(v)) or "://" in v or v.startswith(("/", "./", "~/")) or "@" in v
+
+
+def identifier_value(raw: str, kind: str, quoted: bool) -> bool:
+    """A value under an identifier key (``client_id``) that is worth hiding."""
+    v = raw.strip()
+    if len(v) < 4 or len(v) > 256 or re.search(r"\s", v):
+        return False
+    if not quoted and kind == "source":
+        return False
+    if _trivial_value(v) or v.lower() in NON_SECRET_VALUES or any(p.match(v) for p in _REFERENCE_PATTERNS):
+        return False
+    if is_placeholder_value(v) or "${" in v or "(" in v or "AI_SAFE_" in v:
+        return False
+    if re.fullmatch(r"(?i)x+|\*+|\.+|-+|_+|#+|0+|your[-_].*|example.*|test|demo|sample|changeme", v):
+        return False
+    if v.lower().startswith(("http://", "https://", "/", "./")):
+        return False
+    return not (not quoted and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][\w.]*", v))
 
 # Email addresses. The local part must not follow characters that make it a
 # URL userinfo/path, scoped package or decorator; the domain must end in an
@@ -156,7 +327,7 @@ _REFERENCE_PATTERNS = (
 
 
 _CONTEXT_TOKEN_RULES = {
-    "url-credentials", "query-password", "connection-string-password", "cli-password-flag",
+    "url-credentials", "query-password", "connection-string-password", "cli-password-flag", "libpq-password",
     "mysql-p-flag", "sshpass-flag", "curl-user", "sql-identified-by", "sql-password-func", "sql-set-password",
 }
 
@@ -164,7 +335,7 @@ _CONTEXT_TOKEN_RULES = {
 def _trivial_value(v: str) -> bool:
     """Values in contextual rules that are references/placeholders, not secrets."""
     v = v.strip()
-    if not v or is_placeholder_value(v) or "AI_SAFE_SECRET_" in v:
+    if not v or is_placeholder_value(v) or "AI_SAFE_" in v:
         return True
     if v[0] in "$%{<" or v.lower() in NON_SECRET_VALUES:
         return True
@@ -185,6 +356,19 @@ def shannon_entropy(s: str) -> float:
     counts = Counter(s)
     n = len(s)
     return -sum(c / n * math.log2(c / n) for c in counts.values())
+
+
+_SPDX = re.compile(r"(?i)^(?:[A-Za-z]+-)*(?:A?GPL|LGPL|MIT|BSD|Apache|MPL|ISC|CC|EPL|Unlicense|UNLICENSED|Proprietary|Zlib|Artistic|WTFPL)\b")
+
+
+def _random_looking(v: str) -> bool:
+    """Weak key names (``stripe_key``, ``license``) need a value that looks
+    generated: long enough, mixed letters and digits, no spaces, no licence id."""
+    if len(v) < 12 or re.search(r"\s", v) or _SPDX.match(v):
+        return False
+    if not (re.search(r"\d", v) and re.search(r"[A-Za-z]", v)):
+        return False
+    return shannon_entropy(v) >= 3.0
 
 
 def looks_like_secret_value(value: str, key: str | None, kind: str, quoted: bool) -> bool:
@@ -221,6 +405,10 @@ def looks_like_secret_value(value: str, key: str | None, kind: str, quoted: bool
             return False
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_.]*", v) and kind != "config":
             return False
+    if is_sensitive_key(key) and has_provider_prefix(v):
+        return True  # a provider token under a credential key: no entropy / length / prose gates
+    if is_weak_key(key) and not _random_looking(v):
+        return False
     # Prose ("Enter your password") is not a credential.
     if re.search(r"\s", v):
         if len(v.split()) > 3 or not is_password_key(key):
@@ -232,10 +420,34 @@ def looks_like_secret_value(value: str, key: str | None, kind: str, quoted: bool
     return True
 
 
+_REGEX_META = re.compile(r"[\[\](){}|\\^$*+?]")
+_REGEX_TOKEN = re.compile(r"\\[dwsDWSbB]|\{\d+(?:,\d*)?\}|\(\?P?<|\(\?:|\[\^?[A-Za-z0-9]-[A-Za-z0-9]")
+
+
+def looks_like_regex_or_code(value: str) -> bool:
+    """A regular expression or code fragment (``(?P<secret>[A-Za-z0-9]{32})``),
+    not a credential value."""
+    return len(_REGEX_META.findall(value)) >= 2 and bool(_REGEX_TOKEN.search(value))
+
+
+def accept_engine_finding(rule_id: str, secret: str, key: str | None, path: str) -> bool:
+    """Post-filter for findings of another engine (Gitleaks). Provider rules
+    are trusted; generic rules must pass the builtin value checks."""
+    if looks_like_regex_or_code(secret):
+        return False
+    if rule_id.lower().startswith("generic"):
+        return looks_like_secret_value(secret, key, file_kind(path), quoted=True)
+    return True
+
+
 class BuiltinDetector:
-    def __init__(self, custom_rules: Iterable[CustomRule] = (), enable_builtin: bool = True, emails: bool = True) -> None:
+    def __init__(self, custom_rules: Iterable[CustomRule] = (), enable_builtin: bool = True, emails: bool = True,
+                 usernames: UsernameConfig | None = None, identifiers: IdentifierConfig | None = None) -> None:
         self.enable_builtin = enable_builtin
         self.emails = emails
+        self.usernames = usernames or UsernameConfig()
+        self.identifiers = identifiers or IdentifierConfig()
+        self._id_keys: list[tuple[str, ...]] | None = None
         self.custom: list[tuple[CustomRule, re.Pattern[str]]] = [
             (r, re.compile(r.regex, re.MULTILINE)) for r in custom_rules
         ]
@@ -252,11 +464,16 @@ class BuiltinDetector:
             out.extend(self._assignments(text, lines, path, kind))
             out.extend(self._yaml_blocks(text, lines, path, kind))
             out.extend(self._context(text, lines, path, kind))
+            out.extend(self._containers(text, lines, path, kind))
+            if self.usernames.enabled:
+                out.extend(self._sibling_users(text, lines, path, kind, out))
         if self.emails and path != "<commit-message>":
             # Commit messages never reach the workspace; their trailers
             # (Co-Authored-By, Signed-off-by) would only add noise.
             out.extend(self._emails(text, lines))
         out.extend(self._custom(text, lines))
+        for m in out:
+            _strip_format_prefix(m, lines)
         return _dedupe(out)
 
     # -- rules ------------------------------------------------------------
@@ -280,7 +497,8 @@ class BuiltinDetector:
 
     def _tokens(self, text: str, lines: "_LineIndex", path: str) -> list[RawMatch]:
         out = []
-        for rule in TOKEN_RULES:
+        rules = TOKEN_RULES + (IDENTIFIER_RULES if self.identifiers.enabled else ())
+        for rule in rules:
             for m in rule.regex.finditer(text):
                 group = rule.group
                 if "secret2" in rule.regex.groupindex and m.group("secret") is None:
@@ -306,21 +524,17 @@ class BuiltinDetector:
         out = []
         for m in ASSIGN_QUOTED.finditer(text):
             key = m.group("key")
-            if not is_sensitive_key(key):
-                continue
-            # skip comparisons like `if password == "x"` only when the key is a
-            # plain identifier compared in code (still a hardcoded credential:
-            # keep it - comparisons against literals are a classic leak)
+            # comparisons against literals (`if password == "x"`) are a classic leak: kept
             raw = m.group("secret")
-            if not looks_like_secret_value(raw, key, kind, quoted=True):
+            cat = self._kv_category(key, raw, kind, True, path)
+            if cat is None:
                 continue
             s, e = m.span("secret")
-            cat = categorize("generic-assignment", key, raw, path)
             out.append(self._mk("generic-assignment", cat, s, e, lines, raw, key=key))
         if kind in ("config", "shell"):
             for m in ASSIGN_BARE.finditer(text):
                 key = m.group("key")
-                if not is_sensitive_key(key):
+                if not (is_sensitive_key(key) or self._identifier_key(key)):
                     continue
                 raw = m.group("secret")
                 s, e = m.span("secret")
@@ -329,19 +543,18 @@ class BuiltinDetector:
                     raw, e = raw[:-1], e - 1
                 if raw in ("|", ">", "|-", ">-", "|+", ">+", ""):
                     continue
-                if not looks_like_secret_value(raw, key, kind, quoted=False):
+                cat = self._kv_category(key, raw, kind, False, path)
+                if cat is None:
                     continue
-                cat = categorize("generic-assignment", key, raw, path)
                 out.append(self._mk("generic-assignment", cat, s, e, lines, raw, key=key))
             for m in XML_ELEMENT.finditer(text):
                 key = m.group("key")
-                if not is_sensitive_key(key):
-                    continue
                 raw = m.group("secret")
-                if not looks_like_secret_value(raw, key, "config", quoted=True):
+                cat = self._kv_category(key, raw, "config", True, path, rule="xml")
+                if cat is None:
                     continue
                 s, e = m.span("secret")
-                out.append(self._mk("generic-assignment", categorize("xml", key, raw, path), s, e, lines, raw, key=key))
+                out.append(self._mk("generic-assignment", cat, s, e, lines, raw, key=key))
         return out
 
     def _context(self, text: str, lines: "_LineIndex", path: str, kind: str) -> list[RawMatch]:
@@ -362,10 +575,15 @@ class BuiltinDetector:
         for m in HEREDOC_ASSIGN.finditer(text):
             if is_sensitive_key(m.group("key")):
                 add("heredoc-secret", m, m.group("key"), lambda v: bool(v.strip()) and not is_placeholder_value(v.strip()))
+        def add_kv(rule_id, m, k):
+            raw = m.group("secret")
+            cat = self._kv_category(k, raw, kind, True, path, rule=rule_id)
+            if cat is not None:
+                s_, e_ = m.span("secret")
+                out.append(self._mk(rule_id, cat, s_, e_, lines, raw, key=k if k and k.isidentifier() else None))
+
         for m in CALL_KEY_VALUE.finditer(text):
-            k = m.group("key")
-            if is_sensitive_key(k):
-                add("call-key-value", m, k, lambda v, k=k: looks_like_secret_value(v, k, kind, quoted=True))
+            add_kv("call-key-value", m, m.group("key"))
         for m in WRAPPED_ASSIGN.finditer(text):
             k = m.group("key")
             if is_sensitive_key(k):
@@ -382,13 +600,159 @@ class BuiltinDetector:
         for m in COMMENT_SECRET.finditer(text):
             add("comment-secret", m, m.group("key").replace(" ", "_"), _credential_like)
         for m in INDEX_ASSIGN.finditer(text):
-            k = m.group("key")
-            if is_sensitive_key(k):
-                add("index-assignment", m, k, lambda v, k=k: looks_like_secret_value(v, k, kind, quoted=True))
+            add_kv("index-assignment", m, m.group("key"))
+        for rx in (ENV_FALLBACK_OP, SHELL_DEFAULT):
+            for m in rx.finditer(text):
+                k = m.group("key")
+                add("env-fallback", m, k, lambda v, k=k: not _trivial_value(v) and (
+                    (is_sensitive_key(k) and looks_like_secret_value(v, k, "config", quoted=True))
+                    or (len(v) >= 16 and shannon_entropy(v) >= 3.5)))
         if is_php(path):
             for c in find_call_credentials(text):
-                out.append(self._mk(c.rule_id, c.category, c.start, c.end, lines, c.secret, key=c.key))
+                cat = Category.USERNAME if c.role == "user" else c.category
+                out.append(self._mk(c.rule_id, cat, c.start, c.end, lines, c.secret, key=c.key))
         return out
+
+    def _identifier_key(self, key: str | None) -> bool:
+        if not self.identifiers.enabled or not key:
+            return False
+        if self._id_keys is None:
+            self._id_keys = [tuple(key_words(k)) for k in self.identifiers.keys if key_words(k)]
+        words = tuple(key_words(key))
+        return any(len(words) >= len(k) and words[-len(k):] == k for k in self._id_keys)
+
+    def _kv_category(self, key: str | None, raw: str, kind: str, quoted: bool, path: str,
+                     rule: str = "generic-assignment") -> Category | None:
+        """Category of a ``key = value`` pair, or None when it is not sensitive."""
+        if is_sensitive_key(key):
+            if looks_like_secret_value(raw, key, kind, quoted):
+                return categorize(rule, key, raw, path)
+            return None
+        if self._identifier_key(key) and identifier_value(raw, kind, quoted):
+            return Category.IDENTIFIER
+        return None
+
+    def _containers(self, text: str, lines: "_LineIndex", path: str, kind: str) -> list[RawMatch]:
+        """String leaves of a map / array whose *name* is sensitive
+        (``$keys = [...]``, ``function get_api_key() { return [...]; }``,
+        ``"secrets": {...}``, YAML ``api_keys:`` blocks). Leaf values must look
+        generated (or carry a provider prefix)."""
+        out: list[RawMatch] = []
+        regions: list[tuple[int, int, str]] = []
+        for m in CONTAINER_START.finditer(text):
+            name = m.group("name").strip("'\"$")
+            if not is_container_name(name):
+                continue
+            end = _match_bracket(text, m.end() - 1)
+            if end is not None:
+                regions.append((m.end(), end, name))
+        for m in FUNCTION_DEF.finditer(text):
+            if not is_container_name(m.group("name"), function=True):
+                continue
+            body_end = _match_bracket(text, m.end() - 1)
+            if body_end is None:
+                continue
+            for r in RETURN_ARRAY.finditer(text, m.end(), body_end):
+                end = _match_bracket(text, r.end() - 1)
+                if end is not None:
+                    regions.append((r.end(), end, m.group("name")))
+        for start, end, name in regions:
+            for lm in LEAF_LITERAL.finditer(text, start, end):
+                leaf_key = lm.group("leafkey")
+                raw = lm.group("secret")
+                self._container_leaf(out, lines, path, kind, name, leaf_key, raw, lm.span("secret"))
+        if kind == "config":
+            for m in YAML_PARENT.finditer(text):
+                name = m.group("key")
+                if not is_container_name(name):
+                    continue
+                indent = len(m.group("indent").expandtabs())
+                pos = m.end() + 1
+                for cm in YAML_CHILD.finditer(text, pos):
+                    if cm.start() != pos or len(cm.group("indent").expandtabs()) <= indent:
+                        break
+                    raw = cm.group("secret").strip().strip("'\"")
+                    vs = text.find(raw, cm.start("secret"), cm.end("secret")) if raw else -1
+                    if vs >= 0:
+                        self._container_leaf(out, lines, path, kind, name, cm.group("key"), raw, (vs, vs + len(raw)))
+                    pos = cm.end() + 1
+        return out
+
+    def _container_leaf(self, out, lines, path, kind, name, leaf_key, raw, span) -> None:
+        if leaf_key and (is_sensitive_key(leaf_key) or self._identifier_key(leaf_key) or _not_secret_leaf(leaf_key)):
+            return  # handled by the key rules, or a host / user / url field
+        if not looks_like_secret_value(raw, None, kind, quoted=True) and not has_provider_prefix(raw):
+            return
+        if not (has_provider_prefix(raw) or _random_looking(raw)) or _hostish_value(raw):
+            return
+        key = f"{name}_{leaf_key}" if leaf_key else name
+        cat = categorize("container-leaf", key, raw, path)
+        out.append(self._mk("container-leaf", cat, span[0], span[1], lines, raw, key=key if is_plausible_key(key) else None))
+
+    def _sibling_users(self, text: str, lines: "_LineIndex", path: str, kind: str, found: list[RawMatch]) -> list[RawMatch]:
+        """A user name next to a detected password / secret / token: in the same
+        mapping, the same env / constant group (``DB_USER`` + ``DB_PASS``) or
+        adjacent statements."""
+        secrets_ = [m for m in found if m.key and m.category in _SIBLING_SECRET_CATEGORIES]
+        if not secrets_:
+            return []
+        text_lines = text.split("\n")
+
+        def indent(line_no: int) -> str:
+            t = text_lines[line_no - 1] if 0 < line_no <= len(text_lines) else ""
+            return t[: len(t) - len(t.lstrip())]
+
+        groups = {key_group(m.key) for m in secrets_}
+        bare: dict[int, set[str]] = {}
+        for m in secrets_:
+            if not key_group(m.key):
+                bare.setdefault(m.line, set()).add(indent(m.line))
+
+        def sibling(grp: tuple[str, ...], line: int, ind: str) -> bool:
+            if grp:
+                return grp in groups
+            if line in bare:
+                return True
+            return any(ind in bare.get(ln, ()) for ln in range(line - 4, line + 5))
+
+        out: list[RawMatch] = []
+        seen: set[tuple[int, int]] = set()
+        for rx, quoted in self._user_patterns(kind):
+            for m in rx.finditer(text):
+                key = m.group("key")
+                if not is_user_key(key) or is_sensitive_key(key):
+                    continue
+                raw = m.group("secret")
+                if not self._user_value(raw):
+                    continue
+                s, e = m.span("secret")
+                if (s, e) in seen:
+                    continue
+                line = lines.line_of(s)
+                if not sibling(key_group(key), line, indent(line)):
+                    continue
+                seen.add((s, e))
+                out.append(self._mk("sibling-username", Category.USERNAME, s, e, lines, raw, key=key))
+        return out
+
+    @staticmethod
+    def _user_patterns(kind: str):
+        pats = [(ASSIGN_QUOTED, True), (CALL_KEY_VALUE, True), (INDEX_ASSIGN, True)]
+        if kind in ("config", "shell"):
+            pats += [(ASSIGN_BARE, False), (DOCKER_ENV_SPACE, False), (XML_ELEMENT, True)]
+        return pats
+
+    def _user_value(self, raw: str) -> bool:
+        v = raw.strip()
+        if not v or len(v) > 128 or re.search(r"\s", v) or _trivial_value(v):
+            return False
+        if v.lower() in _DEFAULT_USERS and not self.usernames.include_default_usernames:
+            return False
+        if "@" in v and EMAIL.fullmatch(v):
+            return False  # emails have their own rule
+        if any(p.match(v) for p in _REFERENCE_PATTERNS) or "(" in v:
+            return False
+        return not _hostish_value(v)
 
     def _yaml_blocks(self, text: str, lines: "_LineIndex", path: str, kind: str) -> list[RawMatch]:
         """``password: |`` followed by an indented block: redact the block."""
@@ -442,7 +806,7 @@ class BuiltinDetector:
             if re.fullmatch(r"\d+x", labels[0]):
                 continue  # logo@2x.whatever
             raw = m.group("secret")
-            if "AI_SAFE_SECRET_" in raw:
+            if PLACEHOLDER_NAME_RE.search(raw):
                 continue
             s, e = m.span("secret")
             out.append(self._mk("email-address", Category.EMAIL, s, e, lines, raw))
@@ -478,6 +842,20 @@ class BuiltinDetector:
         )
 
 
+_FORMAT_PREFIX = re.compile(r"(?i)^(?:base64|b64|hex|hex2bin):(?=[A-Za-z0-9+/=_\-]{8,}$)")
+
+
+def _strip_format_prefix(m: RawMatch, lines: "_LineIndex") -> None:
+    """``base64:<key>``: the format prefix stays readable, only the key is secret."""
+    if m.engine != "builtin" or not m.exact:
+        return
+    pm = _FORMAT_PREFIX.match(m.secret)
+    if pm:
+        m.secret = m.secret[pm.end():]
+        m.start += pm.end()
+        m.line = lines.line_of(m.start)
+
+
 class _LineIndex:
     def __init__(self, text: str) -> None:
         self.starts = [0]
@@ -495,10 +873,13 @@ def _dedupe(matches: list[RawMatch]) -> list[RawMatch]:
     region; keep inexact matches always."""
     matches.sort(key=lambda m: (m.start, -(m.end - m.start)))
     out: list[RawMatch] = []
+    max_end = -1  # largest end of an exact match kept so far (all of them start at or before m.start)
     for m in matches:
-        if m.exact and any(o.exact and o.start <= m.start and m.end <= o.end for o in out):
+        if m.exact and m.end <= max_end:
             continue
         out.append(m)
+        if m.exact:
+            max_end = max(max_end, m.end)
     return out
 
 
@@ -536,4 +917,4 @@ def is_plausible_key(key: str | None) -> bool:
     return True
 
 
-__all__ = ["BuiltinDetector", "RawMatch", "key_before", "shannon_entropy", "looks_like_secret_value", "key_words"]
+__all__ = ["BuiltinDetector", "RawMatch", "accept_engine_finding", "key_before", "shannon_entropy", "looks_like_secret_value", "key_words"]

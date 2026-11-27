@@ -9,6 +9,7 @@ from __future__ import annotations
 import functools
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -20,7 +21,7 @@ from ai_safe.config import CONFIG_FILENAME, DEFAULT_CONFIG_YAML, AISafeConfig, C
 from ai_safe.credential_map import PASSPHRASE_ENV, CredentialMap
 from ai_safe.integration import integrate as do_integrate
 from ai_safe.redaction import PlaceholderRegistry
-from ai_safe.reporting import console, render_issues, render_review, render_sanitize, render_scan, write_json
+from ai_safe.reporting import _u, console, render_issues, render_review, render_sanitize, render_scan, write_json
 from ai_safe.sanitizer import Sanitizer, history_summary
 from ai_safe.scanner import Scanner
 from ai_safe.security import REDACTOR, SecurityError, detect_ai_agent_env, safe_display
@@ -288,17 +289,57 @@ def review(
     raise typer.Exit(EXIT_OK if rr.passed else EXIT_FAIL)
 
 
+def _stdin_is_tty() -> bool:
+    return sys.stdin.isatty()
+
+
+def _pick(rr, c) -> set[str]:
+    """Interactive picker for `ai-safe integrate --select` (plain prompt, no TUI)."""
+    from rich.table import Table
+
+    from ai_safe.selection import build_rows, parse_selection, selected_paths
+
+    rows = build_rows(rr)
+    errors = sum(1 for i in rr.issues if i.severity.blocking)
+    warnings = sum(1 for i in rr.issues if i.severity.value == "WARNING")
+    t = Table(title=f"Changes in workspace (review: {errors} error(s), {warnings} warning(s))")
+    for col in ("#", "Status", "Path", "Review"):
+        t.add_column(col, overflow="fold")
+    for n, r in enumerate(rows, 1):
+        t.add_row(str(n) if r.selectable else f"[dim]{n}[/dim]", r.status, _u(r.label), _u(r.review))
+    c.print(t)
+    c.print("Rows without an integratable change (dimmed) cannot be selected. "
+            "Errors in files you do not select do not block; they stay in the workspace.")
+    while True:
+        answer = typer.prompt("Select files to integrate (e.g. 1,3-5 / all / none)", default="", show_default=False)
+        indexes, error = parse_selection(answer, rows)
+        if indexes is not None:
+            return selected_paths(indexes, rows)
+        c.print(f"[yellow]Invalid selection:[/yellow] {_u(error)}. Nothing was guessed; try again.")
+
+
 @app.command()
 @guarded
 def integrate(
     session_id: SessionOpt = None,
     config: ConfigOpt = None,
-    exclude: Annotated[Optional[list[str]], typer.Option("--exclude", "-x", help="Skip this path (repeatable)")] = None,
+    exclude: Annotated[Optional[list[str]], typer.Option("--exclude", "-x", help="Skip this path (repeatable; wins over --only)")] = None,
+    only: Annotated[Optional[list[str]], typer.Option("--only", help="Integrate only this file, directory or glob (repeatable)")] = None,
+    select: Annotated[bool, typer.Option("--select", help="Choose the files to integrate interactively")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Review and build the patch only")] = False,
 ) -> None:
     """Apply reviewed AI changes to the original repository (patch-based, explicit approval, no commit/push)."""
-    session, cfg, store, scanner = _session_context(session_id, config)
+    if detect_ai_agent_env():  # before the session is resolved, with or without --only/--select
+        raise SecurityError("integration must be run by the developer, not by an AI agent. "
+                            "Run `ai-safe integrate` yourself in a normal terminal.")
     c = console()
+    if only and select:
+        c.print("[red]--only and --select cannot be combined.[/red]")
+        raise typer.Exit(EXIT_USAGE)
+    if select and not _stdin_is_tty():
+        c.print("[red]--select needs an interactive terminal.[/red] Use --only PATH instead.")
+        raise typer.Exit(EXIT_USAGE)
+    session, cfg, store, scanner = _session_context(session_id, config)
 
     def confirm(rr, patch: str) -> bool:
         render_review(rr, c)
@@ -309,19 +350,29 @@ def integrate(
         answer = typer.prompt(f"Type 'apply' to integrate {n} change(s) into {session.repo}", default="", show_default=False)
         return answer.strip() == "apply"
 
-    res = do_integrate(session, cfg, scanner, confirm=confirm, exclude_paths=tuple(exclude or ()), dry_run=dry_run)
+    res = do_integrate(session, cfg, scanner, confirm=confirm, exclude_paths=tuple(exclude or ()),
+                       only_paths=tuple(only or ()), select=(lambda rr: _pick(rr, c)) if select else None,
+                       dry_run=dry_run)
     if res.review is not None and res.aborted and res.reason == "review found blocking issues":
         render_review(res.review, c)
     if res.issues:
         render_issues("Final security scan", res.issues, c, False)
     if res.aborted:
-        c.print(f"[yellow]Integration not applied:[/yellow] {res.reason}")
+        c.print(f"[yellow]Integration not applied:[/yellow] {_u(res.reason)}")
         if res.patch_path:
             c.print(f"Redacted patch record: {res.patch_path}")
-        ok_reasons = {"dry run", "no integratable changes"}
+        if res.usage_error:
+            raise typer.Exit(EXIT_USAGE)
+        ok_reasons = {"dry run", "no integratable changes", "nothing selected"}
         raise typer.Exit(EXIT_OK if res.reason in ok_reasons else EXIT_FAIL)
-    write_json(session.reports_dir / "integration.json", {"applied": res.applied, "deleted": res.deleted, "patch": res.patch_path})
+    write_json(session.reports_dir / "integration.json", {
+        "applied": res.applied, "deleted": res.deleted, "patch": res.patch_path,
+        "selected": res.selected, "left_in_workspace": res.left_in_workspace,
+    })
     c.print(f"[green]Applied {len(res.applied)} file(s), deleted {len(res.deleted)}.[/green]")
+    if res.left_in_workspace:
+        c.print(f"{len(res.left_in_workspace)} change(s) left in the workspace (not integrated). "
+                "Integrate them later, or throw them away with `ai-safe resync --discard`.")
     c.print("Nothing was committed or pushed. Inspect with `git diff`, run your tests, then commit yourself.")
 
 
@@ -343,7 +394,9 @@ def resync(
     c.print("[bold yellow]Close any AI session in the workspace before resyncing.[/bold yellow]")
     pending = pending_changes(session)
     if discard and pending:
-        answer = typer.prompt(f"Type 'discard' to throw away {len(pending)} uncommitted workspace change(s)",
+        if session.integrated_files:
+            c.print(f"{len(session.integrated_files)} already-integrated file(s) are safe: they are in the original repository.")
+        answer = typer.prompt(f"Type 'discard' to throw away {len(pending)} workspace change(s) that were NOT integrated",
                               default="", show_default=False)
         if answer.strip() != "discard":
             c.print("[yellow]Resync aborted:[/yellow] workspace left unchanged.")
