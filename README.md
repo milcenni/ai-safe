@@ -163,6 +163,7 @@ flowchart LR
 | `security.py` | Private temp dirs and files, path validation, `O_NOFOLLOW` reads, redactor, HMAC fingerprints, hardened subprocess and Git configuration, secure deletion |
 | `classifier.py` | Credential categorization, sensitive-path matching, file kinds, key-name analysis |
 | `detectors.py` | Built-in detection engine: provider tokens, private keys, key/value assignments, YAML blocks, custom rules |
+| `php_calls.py` | Credentials passed as string literals to PHP calls: databases (`new PDO`, `mysqli_connect`, `pg_connect`, `$this->db->connect(...)`, …), FTP, LDAP, IMAP/POP3, SSH, Redis, AMQP, Memcached, AWS SDK (S3/MinIO), `CURLOPT_USERPWD` |
 | `gitleaks.py` | Hardened Gitleaks wrapper: forced config, ignore files and inline allows disabled, private shredded report |
 | `git_history.py` | Read-only Git access: file lists, staged and unstaged diffs, full-history added lines, commit messages, sanitized summaries |
 | `scanner.py` | Runs both engines across all locations. Deduplicates, classifies and fingerprints findings. |
@@ -500,6 +501,20 @@ passphrase for encrypted values. `AI_SAFE_DEBUG=1` shows tracebacks.
   concatenations, base64- or otherwise encoded values, secrets inside binaries, images or archives. Use
   `custom_rules` for organization-specific formats, and treat every scan result as "nothing *detected*",
   not "nothing present".
+- **Values passed through code are not traced.** In PHP files, credentials passed positionally are
+  recognised only when they are string literals in the call itself. Covered calls: database connections
+  (`new PDO`, `mysqli_connect`, `new mysqli`, `mysql_connect`, `oci_connect`, `odbc_connect`,
+  `pg_connect`, …), `ftp_login`, `ldap_bind`, `imap_open` (IMAP and POP3), `ssh2_auth_password`,
+  `->login(user, pw)` (POP3/IMAP libraries, phpseclib), Redis `->auth(...)`, `new AMQP*Connection`,
+  `->setSaslAuthData`, `new Credentials(key, secret)` (AWS SDK, S3, MinIO) and `CURLOPT_USERPWD`. A
+  literal passed to a wrapper that forwards it through variables, constants, arrays or other functions
+  is found only when the wrapper's name ends in `connect` (optionally followed by a version such as
+  `v2`). Unknown wrappers are assumed to take `(user, password)` or `(host, user, password, …)`.
+  Usernames are redacted only next to a literal password, and never when they are common defaults
+  (`root`, `postgres`, …) or host-like, because redaction replaces long values in every file. Laravel,
+  CodeIgniter, Kafka, MinIO and Guzzle configuration (`'password' => …`, `env('DB_PASSWORD', …)`,
+  `$db['default']['password'] = …`, `define('DB_PASSWORD', …)`, `->set('sasl.password', …)`,
+  `'auth' => ['user', 'pw']`, `.env`) is detected by key name.
 - **Short values.** Values under 8 characters are only replaced where they were detected, and values under
   6 characters only on the reported lines. This avoids corrupting unrelated text.
 - **False positives.** False positives get redacted. This is safe, but it can change program behavior in

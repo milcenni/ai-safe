@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from ai_safe.classifier import categorize, file_kind, is_password_key, is_sensitive_key, key_words
 from ai_safe.config import CustomRule
 from ai_safe.models import Category
+from ai_safe.php_calls import find_call_credentials, is_php
 from ai_safe.security import PLACEHOLDER_NAME_RE, is_placeholder_value
 
 
@@ -104,11 +105,12 @@ ASSIGN_BARE = _r(
 )
 DOCKER_ENV_SPACE = _r(r"^[ \t]*(?:ENV|ARG)[ \t]+" + _KEY + r"[ \t]+(?P<secret>[^\s=][^\s]{0,2047})[ \t]*$", re.MULTILINE)
 HEREDOC_ASSIGN = _r(_KEY + r"[\"']?\s*(?::=|=|:)\s*<<[-~]?\s*[\"']?(?P<tag>[A-Za-z_]\w*)[\"']?[ \t]*\n(?P<secret>(?:(?!\n[ \t]*(?P=tag)\b).){1,4096}?)\n[ \t]*(?P=tag)\b", re.DOTALL)
-CALL_KEY_VALUE = _r(r"\b(?:put|set|setProperty|setdefault|add|header|set_header|with|append|insert)\s*\(\s*(?P<kq>[\"'])(?P<key>[^\"'\n]{1,80})(?P=kq)\s*,\s*(?P<q>[\"'`])(?P<secret>[^\"'`\n]{1,2048})(?P=q)")
+CALL_KEY_VALUE = _r(r"\b(?:define|put|set|setProperty|setdefault|add|header|set_header|with|append|insert)\s*\(\s*(?P<kq>[\"'])(?P<key>[^\"'\n]{1,80})(?P=kq)\s*,\s*(?P<q>[\"'`])(?P<secret>[^\"'`\n]{1,2048})(?P=q)")
 SETTER_CALL = _r(r"(?i)\bset_?(?P<key>password|passwd|secret|token|api_?key|credentials?|private_?key|client_?secret)\s*\(\s*(?P<q>[\"'`])(?P<secret>[^\"'`\n]{1,2048})(?P=q)")
-AUTH_PAIR = _r(r"(?i)\b(?:HTTPBasicAuth|HTTPDigestAuth|BasicAuth|DigestAuth|basic_auth|auth|creds?|credentials|login)\s*(?:=\s*\(?|\(|:\s*\[|=\s*\[)\s*(?P<q1>[\"'])[^\"'\n]{0,128}(?P=q1)\s*,\s*(?P<q>[\"'])(?P<secret>[^\"'\n]{1,2048})(?P=q)")
+AUTH_PAIR = _r(r"(?i)\b(?:HTTPBasicAuth|HTTPDigestAuth|BasicAuth|DigestAuth|basic_auth|auth|creds?|credentials|login)\s*(?:=\s*\(?|\(|:\s*\[|=\s*\[|[\"']\s*=>\s*(?:\[|array\s*\())\s*(?P<q1>[\"'])[^\"'\n]{0,128}(?P=q1)\s*,\s*(?P<q>[\"'])(?P<secret>[^\"'\n]{1,2048})(?P=q)")
 WRAPPED_ASSIGN = _r(_KEY + r"[\"']?\s*(?::=|=|:)\s*(?:new\s+String|String|\[\]byte|bytes?|b|str|Buffer\.from|SecretStr|Secret|Password|Some|Optional\.of)\s*\(\s*(?P<q>[\"'`])(?P<secret>[^\"'`\n]{1,2048})(?P=q)")
-ENV_DEFAULT = _r(r"(?:getenv|environ\.get|ENV\.fetch|env\.get|os\.Getenv(?:OrDefault)?|config\.get|getProperty)\s*\(\s*(?P<kq>[\"'])(?P<key>[^\"'\n]{1,80})(?P=kq)\s*,\s*(?P<q>[\"'`])(?P<secret>[^\"'`\n]{1,2048})(?P=q)")
+ENV_DEFAULT = _r(r"(?:(?<![\w$>.])env|getenv|environ\.get|ENV\.fetch|env\.get|os\.Getenv(?:OrDefault)?|config\.get|getProperty)\s*\(\s*(?P<kq>[\"'])(?P<key>[^\"'\n]{1,80})(?P=kq)\s*,\s*(?P<q>[\"'`])(?P<secret>[^\"'`\n]{1,2048})(?P=q)")
+INDEX_ASSIGN = _r(r"\[\s*(?P<kq>[\"'])(?P<key>[A-Za-z_][\w.\-]{0,80})(?P=kq)\s*\]\s*=(?![=>])\s*(?P<q>[\"'`])(?P<secret>(?:\\.|(?!(?P=q))[^\\\n]){1,2048})(?P=q)")
 COMMENT_SECRET = _r(r"(?im)^[ \t]*(?:#|//|--|;|\*|/\*|<!--|REM\b)[^\n]*?\b(?P<key>password|passwd|pwd|passphrase|secret|token|api[ _-]?key)\b[ \t]*(?:is|was|=|:|->)?[ \t]*(?P<q>[\"'`]?)(?P<secret>[^\s\"'`]{6,256})(?P=q)")
 
 XML_ELEMENT = _r(r"<(?P<key>[A-Za-z_][\w.\-]{0,80})>(?P<secret>[^<>\n]{1,2048})</(?P=key)>")
@@ -355,6 +357,13 @@ class BuiltinDetector:
             add("auth-pair", m, "password", lambda v: looks_like_secret_value(v, "password", kind, quoted=True))
         for m in COMMENT_SECRET.finditer(text):
             add("comment-secret", m, m.group("key").replace(" ", "_"), _credential_like)
+        for m in INDEX_ASSIGN.finditer(text):
+            k = m.group("key")
+            if is_sensitive_key(k):
+                add("index-assignment", m, k, lambda v, k=k: looks_like_secret_value(v, k, kind, quoted=True))
+        if is_php(path):
+            for c in find_call_credentials(text):
+                out.append(self._mk(c.rule_id, c.category, c.start, c.end, lines, c.secret, key=c.key))
         return out
 
     def _yaml_blocks(self, text: str, lines: "_LineIndex", path: str, kind: str) -> list[RawMatch]:
