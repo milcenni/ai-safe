@@ -160,6 +160,8 @@ class SanitizationConfig(_Strict):
     history_summary: bool = False
     history_summary_max_commits: int = Field(default=200, ge=1, le=100000)
     placeholders: PlaceholderConfig = Field(default_factory=PlaceholderConfig)
+    # Email addresses (internal staff, customers) are personal data: replaced by default.
+    sanitize_emails: bool = True
 
     @field_validator("exclude")
     @classmethod
@@ -376,6 +378,7 @@ sanitization:
     - .ssh/
   include_ignored_files: false
   history_summary: false
+  sanitize_emails: true      # false = email addresses are not detected or replaced
   placeholders:
     enabled: true
     deterministic: true

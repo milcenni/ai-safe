@@ -21,6 +21,7 @@ class Category(str, enum.Enum):
     CLOUD_CREDENTIAL = "CLOUD_CREDENTIAL"
     JWT_SECRET = "JWT_SECRET"
     GENERIC_SECRET = "GENERIC_SECRET"
+    EMAIL = "EMAIL"  # personal data, not a credential
 
 
 class Location(str, enum.Enum):

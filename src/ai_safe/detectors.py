@@ -113,6 +113,22 @@ ENV_DEFAULT = _r(r"(?:(?<![\w$>.])env|getenv|environ\.get|ENV\.fetch|env\.get|os
 INDEX_ASSIGN = _r(r"\[\s*(?P<kq>[\"'])(?P<key>[A-Za-z_][\w.\-]{0,80})(?P=kq)\s*\]\s*=(?![=>])\s*(?P<q>[\"'`])(?P<secret>(?:\\.|(?!(?P=q))[^\\\n]){1,2048})(?P=q)")
 COMMENT_SECRET = _r(r"(?im)^[ \t]*(?:#|//|--|;|\*|/\*|<!--|REM\b)[^\n]*?\b(?P<key>password|passwd|pwd|passphrase|secret|token|api[ _-]?key)\b[ \t]*(?:is|was|=|:|->)?[ \t]*(?P<q>[\"'`]?)(?P<secret>[^\s\"'`]{6,256})(?P=q)")
 
+# Email addresses. The local part must not follow characters that make it a
+# URL userinfo/path, scoped package or decorator; the domain must end in an
+# alphabetic TLD and must not continue as an SSH remote path (git@host:repo).
+EMAIL = _r(
+    r"(?:(?<=mailto:)|(?<![A-Za-z0-9._%+\-/:@\\]))(?P<secret>[A-Za-z0-9_%+\-](?:[A-Za-z0-9._%+\-]{0,63})"
+    r"@(?P<domain>(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24}))"
+    r"(?![A-Za-z0-9\-@]|\.[A-Za-z0-9]|:[\w/~])"
+)
+# RFC 2606 / RFC 6761 documentation and special-use names.
+_EMAIL_RESERVED_DOMAINS = ("example.com", "example.org", "example.net")
+# SSH algorithm names (chacha20-poly1305@openssh.com) are protocol identifiers.
+_EMAIL_PROTOCOL_DOMAINS = ("openssh.com", "libssh.org")
+_EMAIL_RESERVED_TLDS = ("example", "test", "invalid", "localhost")
+# "logo@2x.png": an asset name, not a domain.
+_EMAIL_FILE_TLDS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "css", "js", "mjs", "map", "json", "lock", "txt", "md"}
+
 XML_ELEMENT = _r(r"<(?P<key>[A-Za-z_][\w.\-]{0,80})>(?P<secret>[^<>\n]{1,2048})</(?P=key)>")
 YAML_BLOCK = _r(r"^(?P<indent>[ \t]*)(?P<key>[A-Za-z_][\w.\-]{0,80}):[ \t]*[|>][-+0-9]*[ \t]*$", re.MULTILINE)
 
@@ -214,8 +230,9 @@ def looks_like_secret_value(value: str, key: str | None, kind: str, quoted: bool
 
 
 class BuiltinDetector:
-    def __init__(self, custom_rules: Iterable[CustomRule] = (), enable_builtin: bool = True) -> None:
+    def __init__(self, custom_rules: Iterable[CustomRule] = (), enable_builtin: bool = True, emails: bool = True) -> None:
         self.enable_builtin = enable_builtin
+        self.emails = emails
         self.custom: list[tuple[CustomRule, re.Pattern[str]]] = [
             (r, re.compile(r.regex, re.MULTILINE)) for r in custom_rules
         ]
@@ -232,6 +249,10 @@ class BuiltinDetector:
             out.extend(self._assignments(text, lines, path, kind))
             out.extend(self._yaml_blocks(text, lines, path, kind))
             out.extend(self._context(text, lines, path, kind))
+        if self.emails and path != "<commit-message>":
+            # Commit messages never reach the workspace; their trailers
+            # (Co-Authored-By, Signed-off-by) would only add noise.
+            out.extend(self._emails(text, lines))
         out.extend(self._custom(text, lines))
         return _dedupe(out)
 
@@ -404,6 +425,24 @@ class BuiltinDetector:
                 continue
             cat = categorize("yaml-block", key, secret, path)
             out.append(self._mk("yaml-block-secret", cat, first_start, last_end, lines, secret, key=key))
+        return out
+
+    def _emails(self, text: str, lines: "_LineIndex") -> list[RawMatch]:
+        out = []
+        for m in EMAIL.finditer(text):
+            domain = m.group("domain").lower()
+            labels = domain.split(".")
+            if any(domain == d or domain.endswith("." + d) for d in _EMAIL_RESERVED_DOMAINS + _EMAIL_PROTOCOL_DOMAINS):
+                continue
+            if labels[-1] in _EMAIL_RESERVED_TLDS or labels[-1] in _EMAIL_FILE_TLDS:
+                continue
+            if re.fullmatch(r"\d+x", labels[0]):
+                continue  # logo@2x.whatever
+            raw = m.group("secret")
+            if "AI_SAFE_SECRET_" in raw:
+                continue
+            s, e = m.span("secret")
+            out.append(self._mk("email-address", Category.EMAIL, s, e, lines, raw))
         return out
 
     def _custom(self, text: str, lines: "_LineIndex") -> list[RawMatch]:

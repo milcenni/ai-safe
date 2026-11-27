@@ -357,6 +357,7 @@ sanitization:
   include_ignored_files: false
   allowed_binary_extensions: [.png, .jpg, .gif, .ico, .woff2]
   history_summary: false
+  sanitize_emails: true       # false = email addresses are not detected or replaced
   placeholders:
     enabled: true             # false = files with secrets are excluded instead of redacted
     deterministic: true
@@ -515,6 +516,13 @@ passphrase for encrypted values. `AI_SAFE_DEBUG=1` shows tracebacks.
   CodeIgniter, Kafka, MinIO and Guzzle configuration (`'password' => …`, `env('DB_PASSWORD', …)`,
   `$db['default']['password'] = …`, `define('DB_PASSWORD', …)`, `->set('sasl.password', …)`,
   `'auth' => ['user', 'pw']`, `.env`) is detected by key name.
+- **Email addresses** (internal staff, customers) are personal data and are replaced by default
+  (`sanitization.sanitize_emails: true`), with placeholders like every credential. Code that validates
+  email format therefore sees a placeholder in the workspace. Not replaced: documentation domains
+  (`example.com/.org/.net`, `*.example`, `*.test`, `*.invalid`, `*.localhost`), SSH remotes
+  (`git@host:repo`), SSH algorithm names (`…@openssh.com`, `…@libssh.org`), asset names (`logo@2x.png`),
+  package specifiers (`pkg@1.2.3`, `@scope/pkg`), URL userinfo (`https://user@host/`) and commit-message
+  trailers. An email the AI writes itself is a review WARNING (`email-introduced`), not a blocking error.
 - **Short values.** Values under 8 characters are only replaced where they were detected, and values under
   6 characters only on the reported lines. This avoids corrupting unrelated text.
 - **False positives.** False positives get redacted. This is safe, but it can change program behavior in

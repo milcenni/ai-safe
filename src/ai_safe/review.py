@@ -33,7 +33,7 @@ from ai_safe import git_history as gh
 from ai_safe.classifier import ClaudePath, claude_path_policy, is_security_tool_file, is_sensitive_config, sensitive_match
 from ai_safe.config import AISafeConfig
 from ai_safe.credential_map import CredentialMap
-from ai_safe.models import Issue, Location, Severity, is_blocking
+from ai_safe.models import Category, Issue, Location, Severity, is_blocking
 from ai_safe.patch_manager import FileChange, collect_changes, compute_hunks, map_to_original
 from ai_safe.scanner import Scanner
 from ai_safe.security import (
@@ -285,6 +285,11 @@ def _scan_content(report, scanner: Scanner, path: str, text: str, fingerprints, 
     blocked = False
     for m in scanner.detector.scan_text(text, path):
         if is_placeholder_value(m.secret):
+            continue
+        if m.category is Category.EMAIL:
+            # Personal data the AI wrote itself (it never saw the originals):
+            # flag it for the developer, but do not block integration.
+            report.add(Severity.WARNING, "email-introduced", path, "email address introduced", m.line)
             continue
         report.add(Severity.ERROR, "hardcoded-credential", path, f"hardcoded credential introduced ({m.rule_id}, {m.category.value})", m.line)
         blocked = True

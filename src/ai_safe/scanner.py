@@ -82,7 +82,8 @@ class Scanner:
     def __init__(self, cfg: AISafeConfig, salt: bytes, gitleaks: Gitleaks | None = None) -> None:
         self.cfg = cfg
         self.salt = salt
-        self.detector = BuiltinDetector(cfg.scanner.custom_rules, enable_builtin=cfg.scanner.builtin_rules)
+        self.detector = BuiltinDetector(cfg.scanner.custom_rules, enable_builtin=cfg.scanner.builtin_rules,
+                                        emails=cfg.sanitization.sanitize_emails)
         if gitleaks is None and cfg.scanner.engine == "gitleaks":
             gitleaks = Gitleaks.require(cfg.scanner.gitleaks_path, cfg.scanner.timeout_seconds)
         self.gitleaks = gitleaks
