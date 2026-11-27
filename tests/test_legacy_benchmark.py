@@ -9,8 +9,8 @@ import pytest
 from conftest import all_text, prepare, short_word
 from legacy_corpus import NOT_SECRETS, PATTERNS, Pattern
 
-IMPLEMENTED_PHASES = {"stage1"}
-RECALL_FLOOR = 0.40
+IMPLEMENTED_PHASES = {"stage1", "A"}
+RECALL_FLOOR = 0.48
 
 _R = random.Random(2026)
 

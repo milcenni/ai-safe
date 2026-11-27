@@ -516,6 +516,7 @@ passphrase for encrypted values. `AI_SAFE_DEBUG=1` shows tracebacks.
   CodeIgniter, Kafka, MinIO and Guzzle configuration (`'password' => …`, `env('DB_PASSWORD', …)`,
   `$db['default']['password'] = …`, `define('DB_PASSWORD', …)`, `->set('sasl.password', …)`,
   `'auth' => ['user', 'pw']`, `.env`) is detected by key name.
+  Compound legacy names such as `$dbpass`, `$smtppwd` or `$mysqlpassword` count as password names.
 - **Email addresses** (internal staff, customers) are personal data and are replaced by default
   (`sanitization.sanitize_emails: true`), with placeholders like every credential. Code that validates
   email format therefore sees a placeholder in the workspace. Not replaced: documentation domains

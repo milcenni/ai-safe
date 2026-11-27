@@ -152,7 +152,8 @@ SERVICE_PAIRS = {
 def test_service_call_credentials_detected(name):
     u, p = word(6), word(4)
     secrets = found(SERVICE_PAIRS[name](u, p))
-    assert p in secrets, (name, secrets)
+    # A larger match may cover the password ('user:pw' as one CURLOPT_USERPWD value).
+    assert any(p in s for s in secrets), (name, secrets)
     assert any(u in s for s in secrets), (name, secrets)
 
 

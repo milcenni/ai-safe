@@ -247,6 +247,25 @@ def key_words(key: str) -> list[str]:
     return [w.lower() for w in _SPLIT_RE.split(key) if w]
 
 
+_COMPOUND_PW_PREFIXES = (
+    "db", "mysql", "sql", "pg", "mssql", "oracle", "mongo", "admin", "root", "smtp", "ftp", "sftp",
+    "mail", "imap", "pop", "ldap", "redis", "amqp", "rabbit", "user", "app", "api", "ssh", "svc",
+    "service", "master", "sa", "web", "site", "login",
+)
+_COMPOUND_PW_SUFFIXES = ("password", "passwd", "pass", "pwd", "pw")
+_PASSWORD_WORDS = {"password", "passwd", "pwd", "pass", "passphrase", "passcode", "secret"}
+
+
+def split_compound_password(word: str) -> bool:
+    """True for legacy compound names such as ``dbpass``, ``smtppwd`` or
+    ``mysqlpassword``: a known service prefix directly followed by a password
+    word. ``bypass``, ``compass`` and ``passthrough`` do not qualify."""
+    for suffix in _COMPOUND_PW_SUFFIXES:
+        if word.endswith(suffix) and word[: -len(suffix)] in _COMPOUND_PW_PREFIXES:
+            return True
+    return False
+
+
 def is_sensitive_key(key: str | None) -> bool:
     if not key:
         return False
@@ -258,7 +277,7 @@ def is_sensitive_key(key: str | None) -> bool:
         if not (words[-1] == "id" and "secret" in words):
             return False
     joined = "".join(words)
-    if any(w in SECRET_WORDS for w in words):
+    if any(w in SECRET_WORDS or split_compound_password(w) for w in words):
         return True
     if any(pair in SECRET_BIGRAMS for pair in zip(words, words[1:])):
         return True
@@ -272,7 +291,7 @@ def is_password_key(key: str | None) -> bool:
     if not key:
         return False
     words = key_words(key)
-    return any(w in {"password", "passwd", "pwd", "pass", "passphrase", "passcode", "secret"} for w in words)
+    return any(w in _PASSWORD_WORDS or split_compound_password(w) for w in words)
 
 
 # ---------------------------------------------------------------------------
